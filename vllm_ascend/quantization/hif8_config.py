@@ -15,10 +15,16 @@
 # limitations under the License.
 #
 
-"""HiF8 quantization config for vLLM Ascend.
+"""HiF8 quantization config for vLLM Ascend (per-element, native).
 
 Registers the "ascend-hif8" quantization method that routes to the
 W8A8_HIF8 scheme for linear and MoE layers.
+
+Config JSON format:
+{
+    "quant_method": "ascend-hif8",
+    "ignore": ["lm_head", "embed_tokens"]
+}
 """
 
 from typing import Any, Optional, cast
@@ -51,38 +57,23 @@ def _is_fused_moe_layer(layer: torch.nn.Module) -> bool:
 
 @register_quantization_config(ASCEND_HIF8_METHOD)
 class AscendHiF8Config(QuantizationConfig):
-    """Quantization config for Ascend HiF8 (W8A8_HIF8 dynamic).
+    """Quantization config for Ascend HiF8 (W8A8_HIF8, per-element native).
 
-    HiF8 is Huawei's native 8-bit floating point format. This config
-    routes linear and MoE layers to the W8A8_HIF8 quantization scheme.
-
-    Config JSON format:
-    {
-        "quant_method": "ascend-hif8",
-        "block_size": 32,
-        "activation_scheme": "dynamic",
-        "ignore": ["lm_head", "embed_tokens"]
-    }
+    HiF8 is Huawei's native 8-bit floating point format. Each element
+    is independently quantized — no external scales, no blocks.
     """
 
     def __init__(
         self,
         ignore: list[str],
-        block_size: int = 32,
-        activation_scheme: str = "dynamic",
         config: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.ignore = ignore
-        self.block_size = block_size
-        self.activation_scheme = activation_scheme
         self.quant_description = config if config is not None else {}
 
     def __repr__(self) -> str:
-        return (
-            f"AscendHiF8Config(block_size={self.block_size}, "
-            f"activation_scheme={self.activation_scheme})"
-        )
+        return "AscendHiF8Config(per-element native HiF8)"
 
     @classmethod
     def get_name(cls) -> str:
@@ -105,13 +96,9 @@ class AscendHiF8Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "AscendHiF8Config":
         ignore: list[str] = cast(list[str], config.get("ignore", []))
-        block_size = cast(int, config.get("block_size", 32))
-        activation_scheme = cast(str, config.get("activation_scheme", "dynamic"))
 
         return cls(
             ignore=ignore,
-            block_size=block_size,
-            activation_scheme=activation_scheme,
             config=config,
         )
 
@@ -129,7 +116,6 @@ class AscendHiF8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             layer.ascend_quant_method = ASCEND_HIF8_METHOD
 
-            # Use registry to get scheme class
             scheme_cls = get_scheme_class("W8A8_HIF8", "linear")
             if scheme_cls is not None:
                 scheme = scheme_cls()
