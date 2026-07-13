@@ -51,6 +51,7 @@ from .w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
 from .w8a8_pdmix import AscendW8A8PDMixFusedMoeMethod, AscendW8A8PDMixLinearMethod
 from .w8a8_static import AscendW8A8LinearMethod
 from .w8a8fp8_dynamic import AscendW8A8FP8DynamicFusedMoEMethod, AscendW8A8FP8DynamicLinearMethod
+from .w8a8_hif8 import AscendW8A8HiF8FusedMoEMethod, AscendW8A8HiF8LinearMethod
 from .w8a16 import AscendW8A16LinearMethod
 
 
@@ -100,4 +101,6 @@ __all__ = [
     "AscendW4A4MXFP4FlatQuantDynamicLinearMethod",
     "AscendW8A8MXFP8DSDynamicLinearMethod",
     "AscendW4A8MXFPDSDynamicFusedMoEMethod",
+    "AscendW8A8HiF8LinearMethod",
+    "AscendW8A8HiF8FusedMoEMethod",
 ]

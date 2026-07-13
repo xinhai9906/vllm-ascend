@@ -26,9 +26,15 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .compressed_tensors_config import AscendCompressedTensorsConfig
     from .fp8_config import AscendFp8Config
+    from .hif8_config import AscendHiF8Config
     from .modelslim_config import AscendModelSlimConfig
 
-__all__ = ["AscendModelSlimConfig", "AscendCompressedTensorsConfig", "AscendFp8Config"]
+__all__ = [
+    "AscendModelSlimConfig",
+    "AscendCompressedTensorsConfig",
+    "AscendFp8Config",
+    "AscendHiF8Config",
+]
 
 
 def __getattr__(name: str) -> Any:
@@ -44,4 +50,8 @@ def __getattr__(name: str) -> Any:
         from .fp8_config import AscendFp8Config
 
         return AscendFp8Config
+    if name == "AscendHiF8Config":
+        from .hif8_config import AscendHiF8Config
+
+        return AscendHiF8Config
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
