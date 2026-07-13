@@ -15,21 +15,23 @@
 # limitations under the License.
 #
 
-"""W8A8_HIF8 quantization scheme for Ascend NPU.
+"""W8A8_HIF8 quantization scheme for Ascend NPU (per-element, native).
 
-HiF8 is Huawei's native 8-bit floating point format. This scheme implements:
-  - Weight: per-channel static quantization to HiF8 (scale: out_features x 1)
-  - Activation: per-token dynamic quantization to HiF8
-  - MoE: grouped matmul with HiF8 quantization
+HiF8 is Huawei's native 8-bit floating point format. This scheme uses
+per-element quantization without any external scale tensors:
+  - Weight: stored directly in HiF8 dtype (hifloat8), no per-channel scale
+  - Activation: dynamically converted to HiF8 at runtime, per-element
+  - MoE: grouped matmul with native HiF8 dtype
 
-Follows the pattern of AscendW8A8DynamicLinearMethod and matches
-MindSpeed's delayed_hif8_pertensor recipe (per-channel granularity).
+Each element is independently quantized by the HiF8 float format's
+representable precision — no shared exponents, no blocks, no scales.
 """
 
 from collections.abc import Callable
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 import torch_npu
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -40,26 +42,22 @@ from .registry import register_scheme
 
 
 def _get_hif8_dtype() -> torch.dtype:
-    """Get the HiF8 dtype from torch_npu, falling back to uint8 if unavailable."""
+    """Get the native HiF8 dtype from torch_npu."""
     from vllm_ascend.device.mxfp_compat import HIFLOAT8_DTYPE
 
     if HIFLOAT8_DTYPE is not None:
         return HIFLOAT8_DTYPE
-    # Fallback: use uint8 as storage dtype and convert in process_weights_after_loading
-    return torch.uint8
+    # Fallback: float8_e4m3fn for environments without full HiF8 support
+    return torch.float8_e4m3fn
 
 
 @register_scheme("W8A8_HIF8", "linear")
 class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
-    """Linear method for Ascend W8A8_HIF8.
+    """Linear method for per-element W8A8_HIF8.
 
-    Uses HiF8 dynamic per-token quantization for activations and
-    per-channel (static) quantization for weights.
-    Inherits apply() pattern from AscendW8A8DynamicLinearMethod.
+    No external scale tensors — weights and activations are independently
+    quantized per-element via native hifloat8 dtype conversion.
     """
-
-    # The quantization dtype for activations during dynamic quantization
-    act_quant_type: torch.dtype = _get_hif8_dtype()
 
     def __init__(self):
         pass
@@ -67,27 +65,9 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
     def get_weight(
         self, input_size: int, output_size: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
-        """Return weight tensor spec for HiF8 quantized linear layer.
-
-        Weights are stored as uint8 (underlying HiF8 byte representation)
-        for IPC compatibility. Processed to NPU format in
-        process_weights_after_loading.
-        """
-        return {"weight": torch.empty(output_size, input_size, dtype=torch.uint8)}
-
-    def get_perchannel_param(
-        self,
-        output_size: int,
-        params_dtype: torch.dtype,
-    ) -> dict[str, Any]:
-        """Return per-channel scale parameters.
-
-        One scale per output channel (row), stored in fp32.
-        """
-        return {
-            "weight_scale": torch.empty(output_size, 1, dtype=torch.float32),
-            "weight_offset": torch.empty(output_size, 1, dtype=params_dtype),
-        }
+        """Weight stored directly in HiF8 dtype."""
+        weight_dtype = _get_hif8_dtype()
+        return {"weight": torch.empty(output_size, input_size, dtype=weight_dtype)}
 
     def apply(
         self,
@@ -96,67 +76,36 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        """Forward pass with HiF8 quantized matmul.
+        """Forward pass: convert both inputs to HiF8, matmul, cast back.
 
-        Args:
-            layer: The linear layer with quantized weight data.
-            x: Input activation tensor (bf16/fp16).
-            bias: Optional bias tensor.
-            tp_rank: Tensor parallel rank.
-
-        Returns:
-            Output tensor in the original activation dtype.
+        Per-element quantization — no dynamic scale computation, each element
+        independently quantized by the hifloat8 format.
         """
-        # Dynamic per-token HiF8 quantization of activations
-        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(
-            x, dst_type=self.act_quant_type
-        )
+        weight_dtype = _get_hif8_dtype()
+        x_dtype = x.dtype
 
-        # Handle squeezing if dynamic_quant returns 2D scale
-        need_unsqz = False
-        if pertoken_scale.dim() == 2:
-            need_unsqz = True
-            quantized_x = quantized_x.squeeze(dim=1)
-            pertoken_scale = pertoken_scale.squeeze(dim=1)
+        # Convert activation to HiF8
+        x_hif8 = x.to(weight_dtype)
 
-        # Quantized matmul: HiF8 activation x HiF8 weight + scales
-        output = torch_npu.npu_quant_matmul(
-            quantized_x,
-            layer.weight,
-            layer.weight_scale,
-            pertoken_scale=pertoken_scale,
-            bias=bias,
-            output_dtype=x.dtype,
-        )
+        # Matmul in HiF8, cast output back to original dtype
+        output = F.linear(x_hif8, layer.weight, bias=None).to(x_dtype)
 
-        if need_unsqz:
-            output = output.unsqueeze(dim=1)
+        if bias is not None:
+            output = output + bias
+
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Process weights after loading into the model.
-
-        Converts uint8 weights to HiF8 format and applies NPU-optimal
-        memory layout (transpose + NZ format for matmul).
-        """
-        # Transpose weight to NPU-expected layout (K x N → N x K)
+        """Post-loading: transpose to NPU layout and cast to NZ format."""
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-
-        # Cast to NZ format for optimal matmul performance
         layer.weight.data = maybe_trans_nz(layer.weight.data)
-
-        # Flatten scale tensors for npu_quant_matmul
-        layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
-        layer.weight_offset.data = layer.weight_offset.data.flatten()
 
 
 @register_scheme("W8A8_HIF8", "moe")
 class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
-    """FusedMoE method for Ascend W8A8_HIF8.
+    """FusedMoE method for per-element W8A8_HIF8.
 
-    Uses HiF8 quantization for MoE expert weights with grouped matmul.
-    Follows the pattern of AscendW8A8DynamicFusedMoEMethod.
+    MoE expert weights stored directly in HiF8 dtype, no external scales.
     """
 
     quant_type: QuantType = QuantType.W8A8HIF8
@@ -198,23 +147,16 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        """Return weight tensor specs for HiF8 quantized MoE.
-
-        w13_weight: gate+up projections combined (2 * intermediate_size, hidden).
-        w2_weight: down projection (hidden, intermediate_size).
-        """
+        """MoE expert weights in native HiF8 dtype."""
+        weight_dtype = _get_hif8_dtype()
         return {
             "w13_weight": torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                hidden_sizes,
-                dtype=torch.uint8,
+                num_experts, 2 * intermediate_size_per_partition, hidden_sizes,
+                dtype=weight_dtype,
             ),
             "w2_weight": torch.empty(
-                num_experts,
-                hidden_sizes,
-                intermediate_size_per_partition,
-                dtype=torch.uint8,
+                num_experts, hidden_sizes, intermediate_size_per_partition,
+                dtype=weight_dtype,
             ),
         }
 
@@ -225,21 +167,8 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        """Return per-channel scale parameters for MoE weights."""
-        return {
-            "w13_weight_scale": torch.empty(
-                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
-            ),
-            "w13_weight_offset": torch.empty(
-                num_experts, 2 * intermediate_size_per_partition, 1, dtype=params_dtype
-            ),
-            "w2_weight_scale": torch.empty(
-                num_experts, hidden_sizes, 1, dtype=torch.float32
-            ),
-            "w2_weight_offset": torch.empty(
-                num_experts, hidden_sizes, 1, dtype=params_dtype
-            ),
-        }
+        """No external scale params needed for per-element HiF8."""
+        return {}
 
     def apply(
         self,
@@ -267,18 +196,11 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         mc2_mask: torch.Tensor | None = None,
         tid2eid: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """MoE forward pass with HiF8 quantization.
-
-        Currently delegates to the W8A8 base path since the MoE kernel
-        support for HiF8 is in the C++ layer (grouped_matmul_swiglu_quant_v2).
-        The DT_HIFLOAT8 is already supported in the kernel; this Python path
-        routes through the same mechanism.
-        """
+        """MoE forward with per-element HiF8 — delegates to fused experts path."""
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
         from vllm_ascend.flash_common3_context import get_flash_common3_context
         from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
         from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
-        from vllm_ascend.distributed.parallel_state import get_mc2_group
 
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
@@ -286,30 +208,21 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         mix_placement = getattr(layer, "mix_placement", False)
 
         num_logical_experts = get_moe_num_logical_experts(
-            layer,
-            num_experts,
+            layer, num_experts,
             global_redundant_expert_num=global_redundant_expert_num,
             num_shared_experts=n_shared_experts,
         )
 
-        # Select top-k experts
         if self.multistream_overlap_gate:
             fc3_context = get_flash_common3_context()
-            assert fc3_context is not None, (
-                "[vllm-ascend/W8A8_HIF8] flash_common3 context is required "
-                "when multistream_overlap_gate is enabled."
-            )
+            assert fc3_context is not None
             topk_weights = fc3_context.topk_weights
             topk_ids = fc3_context.topk_ids
         else:
             topk_weights, topk_ids = select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                top_k=top_k,
-                use_grouped_topk=use_grouped_topk,
-                renormalize=renormalize,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
+                hidden_states=x, router_logits=router_logits, top_k=top_k,
+                use_grouped_topk=use_grouped_topk, renormalize=renormalize,
+                topk_group=topk_group, num_expert_group=num_expert_group,
                 custom_routing_function=custom_routing_function,
                 scoring_func=scoring_func,
                 routed_scaling_factor=routed_scaling_factor,
@@ -321,14 +234,10 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
                 tid2eid=tid2eid,
             )
 
-        assert topk_ids is not None and topk_weights is not None
-
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
-                expert_indices=topk_ids,
-                expert_scales=topk_weights,
-                num_experts=num_logical_experts,
-                zero_expert_type=zero_expert_type,
+                expert_indices=topk_ids, expert_scales=topk_weights,
+                num_experts=num_logical_experts, zero_expert_type=zero_expert_type,
                 hidden_states=x,
             )
 
@@ -341,57 +250,24 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         topk_weights = topk_weights.to(self.in_dtype)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
-        fused_scale_flag = (
-            _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2
-            and get_ascend_config().enable_fused_mc2 == 1
-        )
 
         if self.dynamic_eplb:
             w1 = layer.w13_weight_list
-            w1_scale = (
-                layer.fused_w1_scale_list if fused_scale_flag
-                else layer.w13_weight_scale_fp32_list
-            )
             w2 = layer.w2_weight_list
-            w2_scale = (
-                layer.fused_w2_scale_list if fused_scale_flag
-                else layer.w2_weight_scale_list
-            )
         else:
             w1 = [layer.w13_weight]
-            w1_scale = (
-                [layer.fused_w1_scale] if fused_scale_flag
-                else [layer.w13_weight_scale_fp32]
-            )
             w2 = [layer.w2_weight]
-            w2_scale = (
-                [layer.fused_w2_scale] if fused_scale_flag
-                else [layer.w2_weight_scale]
-            )
-
-        w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
-        w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
-                hidden_states=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                w1=w1,
-                w2=w2,
-                quant_type=self.quant_type,
-                dynamic_eplb=self.dynamic_eplb,
-                expert_map=expert_map,
+                hidden_states=x, topk_weights=topk_weights, topk_ids=topk_ids,
+                w1=w1, w2=w2, quant_type=self.quant_type,
+                dynamic_eplb=self.dynamic_eplb, expert_map=expert_map,
                 global_redundant_expert_num=global_redundant_expert_num,
                 mc2_mask=mc2_mask,
                 apply_router_weight_on_input=apply_router_weight_on_input,
-                log2phy=log2phy,
-                pertoken_scale=pertoken_scale,
+                log2phy=log2phy, pertoken_scale=pertoken_scale,
                 activation=activation,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                w1_scale_bias=w1_scale_bias,
-                w2_scale_bias=w2_scale_bias,
                 swiglu_limit=layer.swiglu_limit,
             )
         )
@@ -402,47 +278,19 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Process MoE weights after loading.
-
-        Transpose to NPU layout and cast to NZ format for optimal performance.
-        """
+        """Post-loading: transpose and NZ format for MoE weights."""
         from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
 
-        # Cast to NZ format for optimal matmul
-        if self.quant_type in (QuantType.W8A8, QuantType.W8A8HIF8):
-            layer.w13_weight.data = torch_npu.npu_format_cast(
-                layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ
-            )
-            layer.w2_weight.data = torch_npu.npu_format_cast(
-                layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ
-            )
-
-        # Flatten scales
-        layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(
-            layer.w13_weight_scale.data.shape[0], -1
+        layer.w13_weight.data = torch_npu.npu_format_cast(
+            layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ
         )
-        layer.w13_weight_scale_fp32 = layer.w13_weight_scale.data.to(torch.float32)
-        layer.w13_weight_offset.data = layer.w13_weight_offset.data.view(
-            layer.w13_weight_offset.data.shape[0], -1
-        )
-        layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(
-            layer.w2_weight_scale.data.shape[0], -1
-        )
-        layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(
-            layer.w2_weight_offset.data.shape[0], -1
+        layer.w2_weight.data = torch_npu.npu_format_cast(
+            layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ
         )
 
-        # Fused MC2 scale optimization
-        if get_ascend_config().enable_fused_mc2 == 1:
-            from .w8a8_dynamic import scale_from_float_to_int64
-
-            layer.fused_w1_scale = scale_from_float_to_int64(layer.w13_weight_scale.data)
-            layer.fused_w2_scale = scale_from_float_to_int64(layer.w2_weight_scale.data)
-
-        # Dynamic EPLB: unbind per-expert weights for dynamic load balancing
         if self.dynamic_eplb:
             layer.w13_weight_list = [
                 weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)
@@ -450,35 +298,6 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
             layer.w2_weight_list = [
                 weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)
             ]
-            layer.w13_weight_scale_fp32_list = [
-                weight.clone()
-                for weight in layer.w13_weight_scale_fp32.data.unbind(dim=0)
-            ]
-            layer.w2_weight_scale_list = [
-                weight.clone()
-                for weight in layer.w2_weight_scale.data.unbind(dim=0)
-            ]
-            if get_ascend_config().enable_fused_mc2 == 1:
-                layer.fused_w1_scale_list = [
-                    weight.clone()
-                    for weight in layer.fused_w1_scale.view(
-                        len(layer.w13_weight_list), -1
-                    ).data.unbind(dim=0)
-                ]
-                layer.fused_w2_scale_list = [
-                    weight.clone()
-                    for weight in layer.fused_w2_scale.view(
-                        len(layer.w2_weight_list), -1
-                    ).data.unbind(dim=0)
-                ]
-
-            # Clean up original tensors
             del layer.w13_weight
             del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w13_weight_scale_fp32
-            del layer.w2_weight_scale
-            if get_ascend_config().enable_fused_mc2 == 1:
-                del layer.fused_w1_scale
-                del layer.fused_w2_scale
             torch.npu.empty_cache()
