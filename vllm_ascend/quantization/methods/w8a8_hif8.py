@@ -18,12 +18,12 @@
 """W8A8_HIF8 quantization scheme for Ascend NPU.
 
 HiF8 is Huawei's native 8-bit floating point format. This scheme implements:
-  - Weight: per-channel static quantization to HiF8
+  - Weight: per-channel static quantization to HiF8 (scale: out_features x 1)
   - Activation: per-token dynamic quantization to HiF8
   - MoE: grouped matmul with HiF8 quantization
 
-Follows the pattern of AscendW8A8FP8DynamicLinearMethod and
-AscendW8A8DynamicLinearMethod.
+Follows the pattern of AscendW8A8DynamicLinearMethod and matches
+MindSpeed's delayed_hif8_pertensor recipe (per-channel granularity).
 """
 
 from collections.abc import Callable
@@ -159,7 +159,7 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
     Follows the pattern of AscendW8A8DynamicFusedMoEMethod.
     """
 
-    quant_type: QuantType = QuantType.W8A8
+    quant_type: QuantType = QuantType.W8A8HIF8
 
     def __init__(self):
         from vllm.config import CompilationMode, get_current_vllm_config
@@ -412,7 +412,7 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
 
         # Cast to NZ format for optimal matmul
-        if self.quant_type == QuantType.W8A8:
+        if self.quant_type in (QuantType.W8A8, QuantType.W8A8HIF8):
             layer.w13_weight.data = torch_npu.npu_format_cast(
                 layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ
             )
