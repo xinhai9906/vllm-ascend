@@ -41,16 +41,6 @@ from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_lo
 from .registry import register_scheme
 
 
-def _get_hif8_dtype() -> torch.dtype:
-    """Get the native HiF8 dtype from torch_npu."""
-    from vllm_ascend.device.mxfp_compat import HIFLOAT8_DTYPE
-
-    if HIFLOAT8_DTYPE is not None:
-        return HIFLOAT8_DTYPE
-    # Fallback: float8_e4m3fn for environments without full HiF8 support
-    return torch.float8_e4m3fn
-
-
 @register_scheme("W8A8_HIF8", "linear")
 class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
     """Linear method for per-element W8A8_HIF8.
@@ -65,9 +55,9 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
     def get_weight(
         self, input_size: int, output_size: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
-        """Weight stored directly in HiF8 dtype."""
-        weight_dtype = _get_hif8_dtype()
-        return {"weight": torch.empty(output_size, input_size, dtype=weight_dtype)}
+        """Weight received as uint8 (IPC-safe byte container), converted to
+           hifloat8 in process_weights_after_loading."""
+        return {"weight": torch.empty(output_size, input_size, dtype=torch.uint8)}
 
     def apply(
         self,
@@ -81,11 +71,10 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         Per-element quantization — no dynamic scale computation, each element
         independently quantized by the hifloat8 format.
         """
-        weight_dtype = _get_hif8_dtype()
         x_dtype = x.dtype
 
-        # Convert activation to HiF8
-        x_hif8 = x.to(weight_dtype)
+        # Convert activation to HiF8 (per-element, no scale)
+        x_hif8 = x.to(torch_npu.hifloat8)
 
         # Matmul in HiF8, cast output back to original dtype
         output = F.linear(x_hif8, layer.weight, bias=None).to(x_dtype)
@@ -96,7 +85,9 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-loading: transpose to NPU layout and cast to NZ format."""
+        """Post-loading: uint8→hifloat8, transpose, NZ format conversion."""
+        # Convert from IPC byte container back to native HiF8 dtype
+        layer.weight.data = layer.weight.data.view(torch_npu.hifloat8)
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = maybe_trans_nz(layer.weight.data)
 
@@ -147,16 +138,16 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        """MoE expert weights in native HiF8 dtype."""
-        weight_dtype = _get_hif8_dtype()
+        """MoE expert weights received as uint8 (IPC-safe), converted
+           to hifloat8 in process_weights_after_loading."""
         return {
             "w13_weight": torch.empty(
                 num_experts, 2 * intermediate_size_per_partition, hidden_sizes,
-                dtype=weight_dtype,
+                dtype=torch.uint8,
             ),
             "w2_weight": torch.empty(
                 num_experts, hidden_sizes, intermediate_size_per_partition,
-                dtype=weight_dtype,
+                dtype=torch.uint8,
             ),
         }
 
@@ -278,8 +269,12 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-loading: transpose and NZ format for MoE weights."""
+        """Post-loading: uint8→hifloat8, transpose, NZ format for MoE weights."""
         from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+
+        # Convert from IPC byte container back to native HiF8 dtype
+        layer.w13_weight.data = layer.w13_weight.data.view(torch_npu.hifloat8)
+        layer.w2_weight.data = layer.w2_weight.data.view(torch_npu.hifloat8)
 
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
