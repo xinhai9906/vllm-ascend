@@ -15,16 +15,14 @@
 # limitations under the License.
 #
 
-"""W8A8_HIF8 quantization scheme for Ascend NPU (per-element, native).
+"""W8A8_HIF8 quantization scheme for Ascend NPU (per-tensor, shared exponent).
 
-HiF8 is Huawei's native 8-bit floating point format. This scheme uses
-per-element quantization without any external scale tensors:
-  - Weight: stored directly in HiF8 dtype (hifloat8), no per-channel scale
-  - Activation: dynamically converted to HiF8 at runtime, per-element
-  - MoE: grouped matmul with native HiF8 dtype
+HiF8 is Huawei's native 8-bit floating point format. Quantization granularity:
+  - Weight:  per-tensor shared exponent (one scale per weight tensor)
+  - Activation: per-token dynamic via npu_dynamic_quant
+  - MoE: grouped matmul with per-tensor HiF8 weights
 
-Each element is independently quantized by the HiF8 float format's
-representable precision — no shared exponents, no blocks, no scales.
+Matches MindSpeed's delayed_hif8_pertensor recipe.
 """
 
 from collections.abc import Callable
@@ -43,10 +41,10 @@ from .registry import register_scheme
 
 @register_scheme("W8A8_HIF8", "linear")
 class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
-    """Linear method for per-element W8A8_HIF8.
+    """Linear method for per-tensor W8A8_HIF8.
 
-    No external scale tensors — weights and activations are independently
-    quantized per-element via native hifloat8 dtype conversion.
+    Weight: uint8 storage + per-tensor fp32 scale → dequantized to hifloat8 in post-load.
+    Activation: per-token dynamic HiF8 via npu_dynamic_quant.
     """
 
     def __init__(self):
@@ -55,9 +53,12 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
     def get_weight(
         self, input_size: int, output_size: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
-        """Weight received as uint8 (IPC-safe byte container), converted to
-           hifloat8 in process_weights_after_loading."""
+        """Weight stored as uint8 (IPC-safe), converted to hifloat8 in post-load."""
         return {"weight": torch.empty(output_size, input_size, dtype=torch.uint8)}
+
+    def get_pertensor_param(self, params_dtype: torch.dtype, **kwargs: Any) -> dict[str, Any]:
+        """Per-tensor weight scale: one scalar fp32 for the whole weight tensor."""
+        return {"weight_scale": torch.empty(1, dtype=torch.float32)}
 
     def apply(
         self,
@@ -66,28 +67,32 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        """Forward pass: convert both inputs to HiF8, matmul, cast back.
+        """Forward: per-tensor HiF8 activation + per-tensor HiF8 weight, matmul.
 
-        Per-element quantization — no dynamic scale computation, each element
-        independently quantized by the hifloat8 format.
+        Activation: dynamic per-tensor shared_exp, computed on the fly each forward.
+        Weight: already stored in hifloat8 (dequantized in post-load).
         """
         x_dtype = x.dtype
 
-        # Convert activation to HiF8 (per-element, no scale)
-        x_hif8 = x.to(torch_npu.hifloat8)
+        # Per-tensor dynamic activation quantization
+        x_fp = x.float()
+        amax = x_fp.abs().max()
+        scale = torch.pow(2.0, torch.clamp(
+            torch.ceil(torch.log2(amax / 15.0)), -127.0, 127.0
+        ))
+        x_q = torch.round(x_fp / scale).clamp(-15.0, 15.0)
+        x_hif8 = x_q.to(torch_npu.hifloat8)
 
-        # Matmul in HiF8, cast output back to original dtype
         output = F.linear(x_hif8, layer.weight, bias=None).to(x_dtype)
-
         if bias is not None:
             output = output + bias
-
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-loading: uint8→hifloat8, transpose, NZ format conversion."""
-        # Convert from IPC byte container back to native HiF8 dtype
-        layer.weight.data = layer.weight.data.view(torch_npu.hifloat8)
+        """Post-load: uint8→fp32→hifloat8, transpose, NZ format."""
+        # Dequantize: real = (uint8 - 128) * scale
+        weight_fp = (layer.weight.data.float() - 128.0) * layer.weight_scale.data.float()
+        layer.weight.data = weight_fp.to(torch_npu.hifloat8)
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = maybe_trans_nz(layer.weight.data)
 
@@ -138,8 +143,7 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        """MoE expert weights received as uint8 (IPC-safe), converted
-           to hifloat8 in process_weights_after_loading."""
+        """MoE expert weights: uint8 storage, dequantized to hifloat8 in post-load."""
         return {
             "w13_weight": torch.empty(
                 num_experts, 2 * intermediate_size_per_partition, hidden_sizes,
@@ -158,8 +162,11 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        """No external scale params needed for per-element HiF8."""
-        return {}
+        """Per-tensor scales for MoE: one fp32 scalar per expert weight tensor."""
+        return {
+            "w13_weight_scale": torch.empty(num_experts, 1, dtype=torch.float32),
+            "w2_weight_scale": torch.empty(num_experts, 1, dtype=torch.float32),
+        }
 
     def apply(
         self,
@@ -269,12 +276,18 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-loading: uint8→hifloat8, transpose, NZ format for MoE weights."""
+        """Post-load: dequantize uint8→fp32→hifloat8, transpose, NZ format."""
         from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
-        # Convert from IPC byte container back to native HiF8 dtype
-        layer.w13_weight.data = layer.w13_weight.data.view(torch_npu.hifloat8)
-        layer.w2_weight.data = layer.w2_weight.data.view(torch_npu.hifloat8)
+        # Dequantize: real = (uint8 - 128) * scale (per-expert)
+        w13_scale = layer.w13_weight_scale.data.float()
+        w2_scale = layer.w2_weight_scale.data.float()
+        layer.w13_weight.data = (
+            (layer.w13_weight.data.float() - 128.0) * w13_scale.unsqueeze(-1)
+        ).to(torch_npu.hifloat8)
+        layer.w2_weight.data = (
+            (layer.w2_weight.data.float() - 128.0) * w2_scale.unsqueeze(-1)
+        ).to(torch_npu.hifloat8)
 
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
