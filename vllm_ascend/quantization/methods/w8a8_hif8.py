@@ -15,14 +15,15 @@
 # limitations under the License.
 #
 
-"""W8A8_HIF8 quantization scheme for Ascend NPU (per-tensor, shared exponent).
+"""W8A8_HIF8 quantization scheme for Ascend NPU (per-element native + per-tensor scale).
 
-HiF8 is Huawei's native 8-bit floating point format. Quantization granularity:
-  - Weight:  per-tensor shared exponent (one scale per weight tensor)
-  - Activation: per-tensor dynamic (one shared_exp computed on the fly)
+HiF8 is Huawei's native 8-bit float with tapered precision.
+NPU hardware handles Dot/Exponent/Mantissa encoding per element.
+Scale uses Delayed Scaling formula: scale = amax / F8max.
+
+  - Weight:  per-element HiF8 (native Dot encoding) + per-tensor fp32 scale
+  - Activation: per-element native HiF8 (no external scale)
   - MoE: grouped matmul with per-tensor HiF8 weights
-
-Matches MindSpeed's delayed_hif8_pertensor recipe.
 """
 
 from collections.abc import Callable
@@ -41,10 +42,10 @@ from .registry import register_scheme
 
 @register_scheme("W8A8_HIF8", "linear")
 class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
-    """Linear method for per-tensor W8A8_HIF8.
+    """Linear method for W8A8_HIF8: per-element native HiF8 + per-tensor scale.
 
-    Weight: uint8 storage + per-tensor fp32 scale → dequantized to hifloat8 in post-load.
-    Activation: per-tensor dynamic (shared_exp computed each forward).
+    Weight: uint8 storage + per-tensor fp32 scale → *scale → hifloat8 in post-load.
+    Activation: per-element native via x.to(hifloat8) (NPU Dot encoding).
     """
 
     def __init__(self):
@@ -53,7 +54,7 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
     def get_weight(
         self, input_size: int, output_size: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
-        """Weight stored as uint8 (IPC-safe), converted to hifloat8 in post-load."""
+        """Weight stored as uint8 (IPC-safe), dequantized to hifloat8 in post-load."""
         return {"weight": torch.empty(output_size, input_size, dtype=torch.uint8)}
 
     def get_pertensor_param(self, params_dtype: torch.dtype, **kwargs: Any) -> dict[str, Any]:
@@ -67,22 +68,9 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        """Forward: per-tensor HiF8 activation + per-tensor HiF8 weight, matmul.
-
-        Activation: dynamic per-tensor shared_exp, computed on the fly each forward.
-        Weight: already stored in hifloat8 (dequantized in post-load).
-        """
+        """Forward: per-element native HiF8, matmul, cast back."""
         x_dtype = x.dtype
-
-        # Per-tensor dynamic activation quantization
-        x_fp = x.float()
-        amax = x_fp.abs().max()
-        scale = torch.pow(2.0, torch.clamp(
-            torch.ceil(torch.log2(amax / 15.0)), -127.0, 127.0
-        ))
-        x_q = torch.round(x_fp / scale).clamp(-15.0, 15.0)
-        x_hif8 = x_q.to(torch_npu.hifloat8)
-
+        x_hif8 = x.to(torch_npu.hifloat8)
         output = F.linear(x_hif8, layer.weight, bias=None).to(x_dtype)
         if bias is not None:
             output = output + bias
@@ -90,7 +78,6 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Post-load: uint8→hifloat8→×scale, transpose, NZ format."""
-        # uint8 is just the byte container; view back to hifloat8, then apply scale
         weight_hif8 = layer.weight.data.view(torch_npu.hifloat8).float()
         layer.weight.data = (weight_hif8 * layer.weight_scale.data.float()).to(torch_npu.hifloat8)
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
@@ -99,10 +86,7 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
 
 @register_scheme("W8A8_HIF8", "moe")
 class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
-    """FusedMoE method for per-element W8A8_HIF8.
-
-    MoE expert weights stored directly in HiF8 dtype, no external scales.
-    """
+    """FusedMoE method for W8A8_HIF8: per-element native HiF8 + per-expert scale."""
 
     quant_type: QuantType = QuantType.W8A8HIF8
 
@@ -279,7 +263,6 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         """Post-load: uint8→hifloat8→×scale, transpose, NZ format."""
         from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
-        # uint8 is the byte container; view back to hifloat8, then apply per-expert scale
         w13_scale = layer.w13_weight_scale.data.float()
         w2_scale = layer.w2_weight_scale.data.float()
         layer.w13_weight.data = (
