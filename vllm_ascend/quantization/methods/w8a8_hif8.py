@@ -89,10 +89,10 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-load: uint8→fp32→hifloat8, transpose, NZ format."""
-        # Dequantize: real = (uint8 - 128) * scale
-        weight_fp = (layer.weight.data.float() - 128.0) * layer.weight_scale.data.float()
-        layer.weight.data = weight_fp.to(torch_npu.hifloat8)
+        """Post-load: uint8→hifloat8→×scale, transpose, NZ format."""
+        # uint8 is just the byte container; view back to hifloat8, then apply scale
+        weight_hif8 = layer.weight.data.view(torch_npu.hifloat8).float()
+        layer.weight.data = (weight_hif8 * layer.weight_scale.data.float()).to(torch_npu.hifloat8)
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = maybe_trans_nz(layer.weight.data)
 
@@ -276,17 +276,17 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-load: dequantize uint8→fp32→hifloat8, transpose, NZ format."""
+        """Post-load: uint8→hifloat8→×scale, transpose, NZ format."""
         from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
-        # Dequantize: real = (uint8 - 128) * scale (per-expert)
+        # uint8 is the byte container; view back to hifloat8, then apply per-expert scale
         w13_scale = layer.w13_weight_scale.data.float()
         w2_scale = layer.w2_weight_scale.data.float()
         layer.w13_weight.data = (
-            (layer.w13_weight.data.float() - 128.0) * w13_scale.unsqueeze(-1)
+            layer.w13_weight.data.view(torch_npu.hifloat8).float() * w13_scale.unsqueeze(-1)
         ).to(torch_npu.hifloat8)
         layer.w2_weight.data = (
-            (layer.w2_weight.data.float() - 128.0) * w2_scale.unsqueeze(-1)
+            layer.w2_weight.data.view(torch_npu.hifloat8).float() * w2_scale.unsqueeze(-1)
         ).to(torch_npu.hifloat8)
 
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
