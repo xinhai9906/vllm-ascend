@@ -19,7 +19,7 @@
 
 HiF8 is Huawei's native 8-bit floating point format. Quantization granularity:
   - Weight:  per-tensor shared exponent (one scale per weight tensor)
-  - Activation: per-token dynamic via npu_dynamic_quant
+  - Activation: per-tensor dynamic (one shared_exp computed on the fly)
   - MoE: grouped matmul with per-tensor HiF8 weights
 
 Matches MindSpeed's delayed_hif8_pertensor recipe.
@@ -44,7 +44,7 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
     """Linear method for per-tensor W8A8_HIF8.
 
     Weight: uint8 storage + per-tensor fp32 scale → dequantized to hifloat8 in post-load.
-    Activation: per-token dynamic HiF8 via npu_dynamic_quant.
+    Activation: per-tensor dynamic (shared_exp computed each forward).
     """
 
     def __init__(self):
