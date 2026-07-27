@@ -15,14 +15,14 @@
 # limitations under the License.
 #
 
-"""W8A8_HIF8 quantization scheme for Ascend NPU (per-element native + per-tensor scale).
+"""W8A8_HIF8 quantization scheme for Ascend NPU (per-tensor native + per-tensor scale).
 
 HiF8 is Huawei's native 8-bit float with tapered precision.
-NPU hardware handles Dot/Exponent/Mantissa encoding per element.
+NPU hardware handles Dot/Exponent/Mantissa encoding per tensor.
 Scale uses Delayed Scaling formula: scale = amax / F8max.
 
-  - Weight:  per-element HiF8 (native Dot encoding) + per-tensor fp32 scale
-  - Activation: per-element native HiF8 (no external scale)
+  - Weight:  per-tensor HiF8 (native Dot encoding) + per-tensor fp32 scale
+  - Activation: per-tensor native HiF8 (no external scale)
   - MoE: grouped matmul with per-tensor HiF8 weights
 """
 
@@ -42,10 +42,10 @@ from .registry import register_scheme
 
 @register_scheme("W8A8_HIF8", "linear")
 class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
-    """Linear method for W8A8_HIF8: per-element native HiF8 + per-tensor scale.
+    """Linear method for W8A8_HIF8: per-tensor native HiF8 + per-tensor scale.
 
     Weight: uint8 storage + per-tensor fp32 scale → *scale → hifloat8 in post-load.
-    Activation: per-element native via x.to(hifloat8) (NPU Dot encoding).
+    Activation: per-tensor native via x.to(hifloat8) (NPU Dot encoding).
     """
 
     def __init__(self):
@@ -68,7 +68,7 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        """Forward: per-element native HiF8, matmul, cast back."""
+        """Forward: per-tensor native HiF8, matmul, cast back."""
         x_dtype = x.dtype
         x_hif8 = x.to(torch_npu.hifloat8)
         output = F.linear(x_hif8, layer.weight, bias=None).to(x_dtype)
@@ -86,7 +86,7 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
 
 @register_scheme("W8A8_HIF8", "moe")
 class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
-    """FusedMoE method for W8A8_HIF8: per-element native HiF8 + per-expert scale."""
+    """FusedMoE method for W8A8_HIF8: per-tensor native HiF8 + per-expert scale."""
 
     quant_type: QuantType = QuantType.W8A8HIF8
 
@@ -178,7 +178,7 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         mc2_mask: torch.Tensor | None = None,
         tid2eid: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """MoE forward with per-element HiF8 — delegates to fused experts path."""
+        """MoE forward with per-tensor HiF8 — delegates to fused experts path."""
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
         from vllm_ascend.flash_common3_context import get_flash_common3_context
         from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute

@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-"""HiF8 quantization config for vLLM Ascend (per-element, native).
+"""HiF8 quantization config for vLLM Ascend (per-tensor, native).
 
 Registers the "ascend-hif8" quantization method that routes to the
 W8A8_HIF8 scheme for linear and MoE layers.
@@ -57,7 +57,7 @@ def _is_fused_moe_layer(layer: torch.nn.Module) -> bool:
 
 @register_quantization_config(ASCEND_HIF8_METHOD)
 class AscendHiF8Config(QuantizationConfig):
-    """Quantization config for Ascend HiF8 (W8A8_HIF8, per-element native).
+    """Quantization config for Ascend HiF8 (W8A8_HIF8, per-tensor native).
 
     HiF8 is Huawei's native 8-bit floating point format. Each element
     is independently quantized — no external scales, no blocks.
@@ -73,7 +73,7 @@ class AscendHiF8Config(QuantizationConfig):
         self.quant_description = config if config is not None else {}
 
     def __repr__(self) -> str:
-        return "AscendHiF8Config(per-element native HiF8)"
+        return "AscendHiF8Config(per-tensor native HiF8)"
 
     @classmethod
     def get_name(cls) -> str:
