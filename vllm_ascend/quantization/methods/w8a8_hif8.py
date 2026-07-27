@@ -19,7 +19,7 @@
 
 HiF8 is Huawei's native 8-bit float with tapered precision.
 NPU hardware handles Dot/Exponent/Mantissa encoding per tensor.
-Scale uses Delayed Scaling formula: scale = amax / F8max.
+Scale uses tensorwise formula: scale = amax / F8max.
 
   - Weight:  per-tensor HiF8 (native Dot encoding) + per-tensor fp32 scale
   - Activation: per-tensor native HiF8 (no external scale)
