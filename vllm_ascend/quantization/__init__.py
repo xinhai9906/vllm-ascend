@@ -37,6 +37,11 @@ __all__ = [
 ]
 
 
+# Eager import required so @register_quantization_config("ascend-hif8") fires before
+# vLLM validates QUANTIZATION_METHODS during engine startup.
+from . import hif8_config  # noqa: F401
+
+
 def __getattr__(name: str) -> Any:
     if name == "AscendModelSlimConfig":
         from .modelslim_config import AscendModelSlimConfig
