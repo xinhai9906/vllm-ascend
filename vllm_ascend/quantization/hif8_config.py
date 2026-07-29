@@ -122,11 +122,7 @@ class AscendHiF8Config(QuantizationConfig):
                 return AscendLinearMethod(scheme)
 
         if _is_fused_moe_layer(layer):
-            layer.ascend_quant_method = ASCEND_HIF8_METHOD
-            scheme_cls = get_scheme_class("W8A8_HIF8", "moe")
-            if scheme_cls is not None:
-                scheme = scheme_cls()
-                return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid=tid2eid)
+            return None  # MoE uses bf16 path (fused kernel must allow quant_method=None)
 
         logger.warning_once(
             f"[vllm-ascend/HiF8] No scheme found for layer type: {type(layer).__name__}"
