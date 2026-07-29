@@ -32,7 +32,6 @@ import torch
 import torch.nn.functional as F
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
@@ -282,18 +281,9 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-load: transpose and NZ format for MoE weights."""
-        import torch_npu
-
+        """Post-load: transpose only (no NZ — quant_type=NONE uses bf16 path)."""
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
-
-        layer.w13_weight.data = torch_npu.npu_format_cast(
-            layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ
-        )
-        layer.w2_weight.data = torch_npu.npu_format_cast(
-            layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ
-        )
 
         if self.dynamic_eplb:
             layer.w13_weight_list = [
