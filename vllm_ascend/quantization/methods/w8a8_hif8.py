@@ -32,7 +32,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.utils import maybe_trans_nz, ACL_FORMAT_FRACTAL_NZ
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
@@ -101,9 +101,7 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-load: transpose to NPU layout and cast to NZ format."""
-        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-        layer.weight.data = maybe_trans_nz(layer.weight.data)
+        """Post-load: nothing needed — F.linear uses standard (out, in) layout."""
 
 
 @register_scheme("W8A8_HIF8", "moe")
