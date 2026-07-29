@@ -71,7 +71,7 @@ def _decode_hif8(b: torch.Tensor) -> torch.Tensor:
                + d2.int() * ((bi >> 3) & 0x3)
                + d1.int() * ((bi >> 3) & 0x1)).int()
     Es = (e_field >> e_mag_bits) & 1  # exponent sign
-    e_mag = e_field & ((1 << e_mag_bits.clamp(0, 8)) - 1)
+    e_mag = e_field & (torch.pow(2.0, e_mag_bits.float()).int() - 1)
 
     e_implicit = d4.int() * 8 + d3.int() * 4 + d2.int() * 2 + d1.int() * 1
     e = (1 - 2 * Es.float()) * (e_implicit.float() + e_mag.float())  # signed exponent
