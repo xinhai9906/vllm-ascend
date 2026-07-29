@@ -16,11 +16,9 @@
 #
 
 """W8A8_HIF8 pseudo-quantization scheme for Ascend NPU.
-
 Per-tensor scaled fake quant matching verl QAT:
   scale = amax / 49152
   pseudo = _quant_hif8(tensor / scale) * scale
-
 Uses the same _quant_hif8 (tapered precision) as training QAT.
 No real quantization — bf16 weights loaded directly.
 """
@@ -43,7 +41,6 @@ _HIF8_MAX: float = 49152.0
 
 def _quant_hif8(x: torch.Tensor) -> torch.Tensor:
     """Raw HiF8 quantization with tapered precision (per element).
-
     Mantissa bits by exponent magnitude:
       |e| <= 3  → 3 bits (Dot=2)
       |e| <= 7  → 2 bits (Dot=3)
@@ -63,7 +60,6 @@ def _quant_hif8(x: torch.Tensor) -> torch.Tensor:
 
 def _hif8_fake_quant(tensor: torch.Tensor) -> torch.Tensor:
     """Per-tensor HiF8 fake quant matching verl QAT formula.
-
     scale = amax / 49152
     pseudo = _quant_hif8(tensor / scale) * scale
     """
@@ -107,7 +103,7 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
 class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
     """FusedMoE pseudo-quantization: bf16→hifloat8 each forward."""
 
-    quant_type: QuantType = QuantType.NONE  # MoE pseudo-quant: let kernel use bf16 path
+    quant_type: QuantType = QuantType.W8A8HIF8
 
     def __init__(self):
         from vllm.config import CompilationMode, get_current_vllm_config
@@ -256,13 +252,13 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
             w1 = layer.w13_weight_list
             w2 = layer.w2_weight_list
         else:
-            w1 = [layer.w13_weight]
-            w2 = [layer.w2_weight]
+            w1 = layer.w13_weight
+            w2 = layer.w2_weight
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x, topk_weights=topk_weights, topk_ids=topk_ids,
-                w1=w1, w2=w2, quant_type=self.quant_type,
+                w1=w1, w2=w2, quant_type=QuantType.NONE,
                 dynamic_eplb=self.dynamic_eplb, expert_map=expert_map,
                 global_redundant_expert_num=global_redundant_expert_num,
                 mc2_mask=mc2_mask,
@@ -281,7 +277,6 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-load: transpose only (no NZ — quant_type=NONE uses bf16 path)."""
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
 
