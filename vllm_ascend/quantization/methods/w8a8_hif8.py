@@ -108,7 +108,7 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
 class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
     """FusedMoE pseudo-quantization: bf16→hifloat8 each forward."""
 
-    quant_type: QuantType = QuantType.W8A8HIF8
+    quant_type: QuantType = QuantType.NONE  # MoE pseudo-quant: let kernel use bf16 path
 
     def __init__(self):
         from vllm.config import CompilationMode, get_current_vllm_config
