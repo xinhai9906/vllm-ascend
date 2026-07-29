@@ -40,11 +40,56 @@ from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_lo
 from .registry import register_scheme
 
 
+def _decode_hif8(b: torch.Tensor) -> torch.Tensor:
+    """Decode HiF8 uint8 bytes back to float32 values.
+
+    Bit layout per Dot band (exponent is sign-magnitude):
+      Dot=4: S(7) | 11(6,5) | Es,Em(4..1) | M(0)
+      Dot=3: S(7) | 10(6,5) | Es,Em(4..2) | M(1,0)
+      Dot=2: S(7) | 01(6,5) | Es,Em(4,3) | M(2,1,0)
+      Dot=1: S(7) | 001(6,5,4) | Es(3) | M(2,1,0)
+      Dot=0: S(7) | 0001(6,5,4,3) | M(2,1,0)
+    """
+    bi = b.int()
+    S = 1.0 - 2.0 * ((bi >> 7) & 1).float()
+
+    # Dot prefix (after Sign at bit 7)
+    t2 = (bi >> 5) & 0b3
+    t3 = (bi >> 4) & 0x7
+    t4 = (bi >> 3) & 0xF
+
+    d4 = (t2 == 0b11)
+    d3 = (t2 == 0b10)
+    d2 = (t2 == 0b01)
+    d1 = (t3 == 0b001)
+    d0 = (t4 == 0b0001)
+
+    # E field = [Es][Emag]. Extract Es and Emag.
+    e_mag_bits = d4.int() * 3 + d3.int() * 2 + d2.int() * 1
+    e_field = (d4.int() * ((bi >> 1) & 0xF)
+               + d3.int() * ((bi >> 2) & 0x7)
+               + d2.int() * ((bi >> 3) & 0x3)
+               + d1.int() * ((bi >> 3) & 0x1)).int()
+    Es = (e_field >> e_mag_bits) & 1  # exponent sign
+    e_mag = e_field & ((1 << e_mag_bits.clamp(0, 8)) - 1)
+
+    e_implicit = d4.int() * 8 + d3.int() * 4 + d2.int() * 2 + d1.int() * 1
+    e = (1 - 2 * Es.float()) * (e_implicit.float() + e_mag.float())  # signed exponent
+
+    # Mantissa
+    m_bits = d4.int() * 1 + d3.int() * 2 + (d2 | d1 | d0).int() * 3
+    m_raw = (d4.int() * (bi & 0x1)
+             + d3.int() * (bi & 0x3)
+             + (d2 | d1 | d0).int() * (bi & 0x7)).float()
+
+    return S * (1.0 + m_raw / torch.pow(2.0, m_bits.float())) * torch.pow(2.0, e)
+
+
 @register_scheme("W8A8_HIF8", "linear")
 class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
     """Linear method for W8A8_HIF8: per-tensor native HiF8 + per-tensor scale.
 
-    Weight: uint8 storage + per-tensor fp32 scale → *scale → hifloat8 in post-load.
+    Weight: uint8 (HiF8 bytes) → _decode_hif8 → *scale → hifloat8 in post-load.
     Activation: per-tensor native via x.to(hifloat8) (NPU Dot encoding).
     """
 
@@ -54,7 +99,7 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
     def get_weight(
         self, input_size: int, output_size: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
-        """Weight stored as uint8 (IPC-safe), dequantized to hifloat8 in post-load."""
+        """Weight stored as uint8 (encoded HiF8 bytes), decoded in post-load."""
         return {"weight": torch.empty(output_size, input_size, dtype=torch.uint8)}
 
     def get_pertensor_param(self, params_dtype: torch.dtype, **kwargs: Any) -> dict[str, Any]:
@@ -77,9 +122,9 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-load: uint8→hifloat8→×scale, transpose, NZ format."""
-        weight_hif8 = layer.weight.data.view(torch_npu.hifloat8).float()
-        layer.weight.data = (weight_hif8 * layer.weight_scale.data.float()).to(torch_npu.hifloat8)
+        """Post-load: uint8→decode→×scale→hifloat8, transpose, NZ format."""
+        weight_fp = _decode_hif8(layer.weight.data) * layer.weight_scale.data.float()
+        layer.weight.data = weight_fp.to(torch_npu.hifloat8)
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = maybe_trans_nz(layer.weight.data)
 
@@ -127,7 +172,7 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        """MoE expert weights: uint8 storage, dequantized to hifloat8 in post-load."""
+        """MoE expert weights: uint8 (encoded HiF8 bytes), decoded in post-load."""
         return {
             "w13_weight": torch.empty(
                 num_experts, 2 * intermediate_size_per_partition, hidden_sizes,
@@ -260,16 +305,16 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-load: uint8→hifloat8→×scale, transpose, NZ format."""
+        """Post-load: uint8→decode→×scale→hifloat8, transpose, NZ format."""
         from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
         w13_scale = layer.w13_weight_scale.data.float()
         w2_scale = layer.w2_weight_scale.data.float()
         layer.w13_weight.data = (
-            layer.w13_weight.data.view(torch_npu.hifloat8).float() * w13_scale.unsqueeze(-1)
+            _decode_hif8(layer.w13_weight.data) * w13_scale.unsqueeze(-1)
         ).to(torch_npu.hifloat8)
         layer.w2_weight.data = (
-            layer.w2_weight.data.view(torch_npu.hifloat8).float() * w2_scale.unsqueeze(-1)
+            _decode_hif8(layer.w2_weight.data) * w2_scale.unsqueeze(-1)
         ).to(torch_npu.hifloat8)
 
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
