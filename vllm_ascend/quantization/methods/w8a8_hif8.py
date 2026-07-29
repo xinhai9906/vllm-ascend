@@ -54,7 +54,7 @@ def _decode_hif8(b: torch.Tensor) -> torch.Tensor:
     S = 1.0 - 2.0 * ((bi >> 7) & 1).float()
 
     # Dot prefix (after Sign at bit 7)
-    t2 = (bi >> 5) & 0b3
+    t2 = (bi >> 5) & 0b11
     t3 = (bi >> 4) & 0x7
     t4 = (bi >> 3) & 0xF
 
@@ -123,8 +123,10 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Post-load: uint8→decode→×scale→hifloat8, transpose, NZ format."""
-        weight_fp = _decode_hif8(layer.weight.data) * layer.weight_scale.data.float()
-        layer.weight.data = weight_fp.to(torch_npu.hifloat8)
+        device = layer.weight.device
+        # Decode on CPU (bit ops are not NPU-safe), then move back
+        weight_fp = _decode_hif8(layer.weight.data.cpu()) * layer.weight_scale.data.float()
+        layer.weight.data = weight_fp.to(device).to(torch_npu.hifloat8)
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = maybe_trans_nz(layer.weight.data)
 
@@ -308,14 +310,15 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         """Post-load: uint8→decode→×scale→hifloat8, transpose, NZ format."""
         from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
+        device = layer.w13_weight.device
         w13_scale = layer.w13_weight_scale.data.float()
         w2_scale = layer.w2_weight_scale.data.float()
         layer.w13_weight.data = (
-            _decode_hif8(layer.w13_weight.data) * w13_scale.unsqueeze(-1)
-        ).to(torch_npu.hifloat8)
+            _decode_hif8(layer.w13_weight.data.cpu()) * w13_scale.unsqueeze(-1)
+        ).to(device).to(torch_npu.hifloat8)
         layer.w2_weight.data = (
-            _decode_hif8(layer.w2_weight.data) * w2_scale.unsqueeze(-1)
-        ).to(torch_npu.hifloat8)
+            _decode_hif8(layer.w2_weight.data.cpu()) * w2_scale.unsqueeze(-1)
+        ).to(device).to(torch_npu.hifloat8)
 
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
