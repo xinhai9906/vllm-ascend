@@ -17,8 +17,12 @@
 
 """W8A8_HIF8 pseudo-quantization scheme for Ascend NPU.
 
-Both weight and activation are converted to hifloat8 on-the-fly each forward.
-No real quantization — bf16 weights are loaded directly.
+Per-tensor scaled fake quant matching verl QAT:
+  scale = amax / 49152
+  pseudo = _quant_hif8(tensor / scale) * scale
+
+Uses the same _quant_hif8 (tapered precision) as training QAT.
+No real quantization — bf16 weights loaded directly.
 """
 
 from collections.abc import Callable
@@ -26,10 +30,9 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-import torch_npu
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.utils import maybe_trans_nz
+from vllm_ascend.utils import maybe_trans_nz, ACL_FORMAT_FRACTAL_NZ
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
@@ -39,14 +42,40 @@ from .registry import register_scheme
 _HIF8_MAX: float = 49152.0
 
 
+def _quant_hif8(x: torch.Tensor) -> torch.Tensor:
+    """Raw HiF8 quantization with tapered precision (per element).
+
+    Mantissa bits by exponent magnitude:
+      |e| <= 3  → 3 bits (Dot=2)
+      |e| <= 7  → 2 bits (Dot=3)
+      |e| <= 15 → 1 bit (Dot=4)
+    """
+    x_unsigned = x.abs()
+    sign = x.sign()
+    eps = x_unsigned.amax().clamp(min=1e-30) * 1e-8
+    e = torch.floor(torch.log2(x_unsigned + eps))
+    abse = e.abs()
+    mant_bits = torch.where(abse <= 3, 3.0,
+                   torch.where(abse <= 7, 2.0,
+                   torch.where(abse <= 15, 1.0, 0.0)))
+    q = torch.floor(x_unsigned * 2.0 ** (-e + mant_bits) + 0.5)
+    return q * 2.0 ** (e - mant_bits) * sign
+
+
+def _hif8_fake_quant(tensor: torch.Tensor) -> torch.Tensor:
+    """Per-tensor HiF8 fake quant matching verl QAT formula.
+
+    scale = amax / 49152
+    pseudo = _quant_hif8(tensor / scale) * scale
+    """
+    amax = tensor.float().abs().max()
+    scale = (amax / _HIF8_MAX).clamp(min=1e-12)
+    return _quant_hif8(tensor.float() / scale) * scale
+
+
 @register_scheme("W8A8_HIF8", "linear")
 class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
-    """Per-tensor pseudo-quantization: scale→hifloat8→dequant each forward.
-
-    Matches verl's QAT formula:
-      scale = amax / 49152
-      pseudo = (tensor/scale).to(hifloat8).float() * scale
-    """
+    """Per-tensor pseudo-quant matching verl QAT: _quant_hif8 with tensorwise scale."""
 
     def __init__(self):
         pass
@@ -64,19 +93,10 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        """Per-tensor scaled pseudo-quant for both weight and activation."""
+        """Per-tensor scaled pseudo-quant (same _quant_hif8 as QAT training)."""
         x_dtype = x.dtype
-
-        # Activation: per-tensor scale → hifloat8 → dequant
-        xf = x.float()
-        x_scale = (xf.abs().max() / _HIF8_MAX).clamp(min=1e-12)
-        x_fq = (xf / x_scale).to(torch_npu.hifloat8).float() * x_scale
-
-        # Weight: per-tensor scale → hifloat8 → dequant
-        wf = layer.weight.float()
-        w_scale = (wf.abs().max() / _HIF8_MAX).clamp(min=1e-12)
-        w_fq = (wf / w_scale).to(torch_npu.hifloat8).float() * w_scale
-
+        x_fq = _hif8_fake_quant(x)
+        w_fq = _hif8_fake_quant(layer.weight)
         output = F.linear(x_fq.to(x_dtype), w_fq.to(x_dtype), bias=bias)
         return output
 
@@ -260,7 +280,7 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Post-load: transpose and NZ format for MoE weights."""
-        from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+        import torch_npu
 
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
