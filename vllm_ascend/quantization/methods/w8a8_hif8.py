@@ -104,8 +104,10 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         """Post-load: nothing needed — F.linear uses standard (out, in) layout."""
 
 
-@register_scheme("W8A8_HIF8", "moe")
-class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
+# MoE pseudo-quant NOT supported — fused experts kernel requires real scale params.
+# MoE layers fall through to bf16 via hif8_config returning None for FusedMoE.
+# @register_scheme("W8A8_HIF8", "moe")  # disabled
+class _AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
     """FusedMoE pseudo-quantization: bf16→hifloat8 each forward."""
 
     quant_type: QuantType = QuantType.W8A8HIF8
