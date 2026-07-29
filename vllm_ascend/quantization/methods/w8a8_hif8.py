@@ -271,6 +271,8 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
                 log2phy=log2phy, pertoken_scale=pertoken_scale,
                 activation=activation,
                 swiglu_limit=layer.swiglu_limit,
+                w1_scale=[layer.w13_weight_scale],
+                w2_scale=[layer.w2_weight_scale],
             )
         )
 
