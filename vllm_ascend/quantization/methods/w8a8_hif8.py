@@ -58,22 +58,44 @@ def _quant_hif8(x: torch.Tensor) -> torch.Tensor:
     return q * 2.0 ** (e - mant_bits) * sign
 
 
-def _hif8_fake_quant(tensor: torch.Tensor) -> torch.Tensor:
-    """Per-tensor HiF8 fake quant matching verl QAT formula.
-    scale = amax / 49152
-    pseudo = _quant_hif8(tensor / scale) * scale
+def _hif8_fake_quant(
+    tensor: torch.Tensor, granularity: str = "per_tensor", group_size: int = 32
+) -> torch.Tensor:
+    """HiF8 fake quant matching verl QAT, with configurable granularity.
+
+    granularity='per_tensor':  one scale per tensor
+    granularity='per_channel': one scale per output channel (weight) / per token (act)
+    granularity='per_group':   one scale per group of group_size elements
     """
-    amax = tensor.float().abs().max()
+    if granularity == "per_group":
+        t = tensor.float()
+        dim_size = t.shape[-1]
+        pad = (group_size - dim_size % group_size) % group_size
+        if pad:
+            t = F.pad(t, (0, pad))
+        t_blocks = t.unflatten(-1, (-1, group_size))
+        amax = t_blocks.abs().amax(dim=-1, keepdim=True)
+        scale = (amax / _HIF8_MAX).clamp(min=1e-12)
+        q_blocks = _quant_hif8(t_blocks / scale) * scale
+        result = q_blocks.flatten(-2, -1)
+        if pad:
+            result = result[..., :dim_size]
+        return result.to(tensor.dtype)
+    elif granularity == "per_channel":
+        amax = tensor.float().abs().amax(dim=-1, keepdim=True)
+    else:
+        amax = tensor.float().abs().max()
     scale = (amax / _HIF8_MAX).clamp(min=1e-12)
     return _quant_hif8(tensor.float() / scale) * scale
 
 
 @register_scheme("W8A8_HIF8", "linear")
 class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
-    """Per-tensor pseudo-quant matching verl QAT: _quant_hif8 with tensorwise scale."""
+    """Per-tensor/per-channel/per-group pseudo-quant matching verl QAT."""
 
-    def __init__(self):
-        pass
+    def __init__(self, granularity: str = "per_tensor", group_size: int = 32):
+        self.granularity = granularity
+        self.group_size = group_size
 
     def get_weight(
         self, input_size: int, output_size: int, params_dtype: torch.dtype
@@ -88,10 +110,10 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        """Per-tensor scaled pseudo-quant (same _quant_hif8 as QAT training)."""
+        """Pseudo-quant with configured granularity (same _quant_hif8 as QAT)."""
         x_dtype = x.dtype
-        x_fq = _hif8_fake_quant(x)
-        w_fq = _hif8_fake_quant(layer.weight)
+        x_fq = _hif8_fake_quant(x, self.granularity, self.group_size)
+        w_fq = _hif8_fake_quant(layer.weight, self.granularity, self.group_size)
         output = F.linear(x_fq.to(x_dtype), w_fq.to(x_dtype), bias=bias)
         return output
 

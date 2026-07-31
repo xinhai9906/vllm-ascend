@@ -15,15 +15,16 @@
 # limitations under the License.
 #
 
-"""HiF8 pseudo-quantization config for vLLM Ascend (per-tensor, software).
+"""HiF8 pseudo-quantization config for vLLM Ascend.
 
 Registers the "ascend-hif8" quantization method that routes to the
 W8A8_HIF8 scheme for linear and MoE layers.
-"""
 
 Config JSON format:
 {
     "quant_method": "ascend-hif8",
+    "granularity": "per_tensor",
+    "group_size": 32,
     "ignore": ["lm_head", "embed_tokens"]
 }
 """
@@ -66,14 +67,18 @@ class AscendHiF8Config(QuantizationConfig):
     def __init__(
         self,
         ignore: list[str],
+        granularity: str = "per_tensor",
+        group_size: int = 32,
         config: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.ignore = ignore
+        self.granularity = granularity
+        self.group_size = group_size
         self.quant_description = config if config is not None else {}
 
     def __repr__(self) -> str:
-        return "AscendHiF8Config(per-tensor pseudo-quant HiF8)"
+        return f"AscendHiF8Config({self.granularity} pseudo-quant HiF8)"
 
     @classmethod
     def get_name(cls) -> str:
@@ -96,9 +101,13 @@ class AscendHiF8Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "AscendHiF8Config":
         ignore: list[str] = cast(list[str], config.get("ignore", []))
+        granularity: str = cast(str, config.get("granularity", "per_tensor"))
+        group_size: int = cast(int, config.get("group_size", 32))
 
         return cls(
             ignore=ignore,
+            granularity=granularity,
+            group_size=group_size,
             config=config,
         )
 
@@ -118,7 +127,7 @@ class AscendHiF8Config(QuantizationConfig):
 
             scheme_cls = get_scheme_class("W8A8_HIF8", "linear")
             if scheme_cls is not None:
-                scheme = scheme_cls()
+                scheme = scheme_cls(granularity=self.granularity, group_size=self.group_size)
                 return AscendLinearMethod(scheme)
 
         if _is_fused_moe_layer(layer):
