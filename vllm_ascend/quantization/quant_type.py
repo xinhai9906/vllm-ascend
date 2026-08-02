@@ -35,3 +35,4 @@ class QuantType(Enum):
     W4A8MXFP = 6
     W8A8FP8 = 7
     W4A16MXFP4 = 8
+    W8A8HIF8 = 9
