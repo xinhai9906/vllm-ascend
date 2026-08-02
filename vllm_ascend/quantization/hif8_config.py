@@ -57,8 +57,9 @@ def _is_fused_moe_layer(layer: torch.nn.Module) -> bool:
 
 @register_quantization_config(ASCEND_HIF8_METHOD)
 class AscendHiF8Config(QuantizationConfig):
-    """Quantization config for Ascend HiF8 (W8A8_HIF8, per-tensor pseudo-quant).
+    """Quantization config for Ascend HiF8 (W8A8_HIF8 pseudo-quant).
     Uses the same _quant_hif8 tapered-precision software quant as verl QAT.
+    Supports per_tensor, per_channel, and per_group granularity.
     """
 
     def __init__(
@@ -131,7 +132,7 @@ class AscendHiF8Config(QuantizationConfig):
             layer.ascend_quant_method = ASCEND_HIF8_METHOD
             scheme_cls = get_scheme_class("W8A8_HIF8", "moe")
             if scheme_cls is not None:
-                scheme = scheme_cls()
+                scheme = scheme_cls(granularity=self.granularity, group_size=self.group_size)
                 return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid=tid2eid)
 
         logger.warning_once(

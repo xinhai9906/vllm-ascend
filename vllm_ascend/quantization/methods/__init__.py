@@ -65,8 +65,6 @@ def is_mx_quant_type(instance: Any) -> bool:
         AscendW4A8MXFPDynamicLinearMethod,
         AscendW4A8MXFPDynamicFusedMoEMethod,
         AscendW4A16MXFP4FusedMoEMethod,
-        "AscendW8A8HiF8LinearMethod",
-        "AscendW8A8HiF8FusedMoEMethod",
     )
     return isinstance(instance, MX_QUANT_TYPES)
 
@@ -103,4 +101,6 @@ __all__ = [
     "AscendW4A4MXFP4FlatQuantDynamicLinearMethod",
     "AscendW8A8MXFP8DSDynamicLinearMethod",
     "AscendW4A8MXFPDSDynamicFusedMoEMethod",
+    "AscendW8A8HiF8LinearMethod",
+    "AscendW8A8HiF8FusedMoEMethod",
 ]

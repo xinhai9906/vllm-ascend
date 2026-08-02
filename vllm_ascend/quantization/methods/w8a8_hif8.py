@@ -126,11 +126,13 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
 
     quant_type: QuantType = QuantType.W8A8HIF8
 
-    def __init__(self):
+    def __init__(self, granularity: str = "per_tensor", group_size: int = 32):
         from vllm.config import CompilationMode, get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
         ascend_config = get_ascend_config()
+        self.granularity = granularity
+        self.group_size = group_size
         self.use_aclgraph = (
             vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
             and not vllm_config.model_config.enforce_eager
@@ -269,12 +271,18 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
 
+        # HiF8 pseudo-quant: activation
+        x = _hif8_fake_quant(x, self.granularity, self.group_size)
+
+        # HiF8 pseudo-quant: expert weights
         if self.dynamic_eplb:
-            w1 = layer.w13_weight_list
-            w2 = layer.w2_weight_list
+            w1 = [_hif8_fake_quant(w, self.granularity, self.group_size)
+                  for w in layer.w13_weight_list]
+            w2 = [_hif8_fake_quant(w, self.granularity, self.group_size)
+                  for w in layer.w2_weight_list]
         else:
-            w1 = layer.w13_weight
-            w2 = layer.w2_weight
+            w1 = _hif8_fake_quant(layer.w13_weight, self.granularity, self.group_size)
+            w2 = _hif8_fake_quant(layer.w2_weight, self.granularity, self.group_size)
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
