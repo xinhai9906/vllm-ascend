@@ -23,8 +23,9 @@ Configurable-granularity fake quant matching verl QAT:
 
 Granularity modes (per_tensor / per_channel / per_group) share the same
 _quant_hif8 tapered-precision kernel as training QAT.
-Weights are quantized once then cached; activations are re-quantized every
-forward.  No real hardware quantization — all computation stays in bf16.
+Weights and activations are both re-quantized every forward — no caching,
+to avoid double bf16 memory during verl weight sync.  All computation
+stays in bf16 (no real hardware quantization).
 """
 
 from collections.abc import Callable
@@ -114,29 +115,17 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
         """Pseudo-quant with configured granularity (same _quant_hif8 as QAT).
-        Weight is quantized once and cached until the underlying tensor changes
-        (e.g. after a verl weight sync).  Activation is quantized every forward.
+        Weight and activation are both re-quantized every forward.
+        No caching — avoids double bf16 memory that would OOM during weight sync.
         """
         x_dtype = x.dtype
-
-        # Activation quant — must redo every forward
         x_fq = _hif8_fake_quant(x, self.granularity, self.group_size).contiguous()
-
-        # Weight quant — cache across forwards, invalidate when weights change
-        w_ptr = layer.weight.data_ptr()
-        if getattr(layer, "_hif8_cached_w_ptr", None) != w_ptr:
-            layer._hif8_cached_weight = (
-                _hif8_fake_quant(layer.weight, self.granularity, self.group_size)
-                .contiguous())
-            layer._hif8_cached_w_ptr = w_ptr
-
-        output = F.linear(x_fq.to(x_dtype),
-                          layer._hif8_cached_weight.to(x_dtype), bias=bias)
+        w_fq = _hif8_fake_quant(layer.weight, self.granularity, self.group_size).contiguous()
+        output = F.linear(x_fq.to(x_dtype), w_fq.to(x_dtype), bias=bias)
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-load: invalidate cache so first apply triggers re-quant."""
-        layer._hif8_cached_w_ptr = None
+        """Post-load: nothing needed — F.linear uses standard (out, in) layout."""
 
 
 @register_scheme("W8A8_HIF8", "moe")
@@ -293,41 +282,17 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         # HiF8 pseudo-quant: activation — must redo every forward
         x = _hif8_fake_quant(x, self.granularity, self.group_size).contiguous()
 
-        # HiF8 pseudo-quant: expert weights — cache across forwards
+        # HiF8 pseudo-quant: expert weights — re-quantize every forward.
+        # MoE weights are too large to cache a second bf16 copy (~25 GB);
+        # the quant overhead is amortised by the fused_experts computation.
         if self.dynamic_eplb:
-            w1_ptr = tuple(w.data_ptr() for w in layer.w13_weight_list)
-            if getattr(layer, "_hif8_cached_w1_ptr", None) != w1_ptr:
-                layer._hif8_cached_w1 = [
-                    _hif8_fake_quant(w, self.granularity, self.group_size
-                                     ).contiguous()
-                    for w in layer.w13_weight_list]
-                layer._hif8_cached_w1_ptr = w1_ptr
-            w1 = layer._hif8_cached_w1
-
-            w2_ptr = tuple(w.data_ptr() for w in layer.w2_weight_list)
-            if getattr(layer, "_hif8_cached_w2_ptr", None) != w2_ptr:
-                layer._hif8_cached_w2 = [
-                    _hif8_fake_quant(w, self.granularity, self.group_size
-                                     ).contiguous()
-                    for w in layer.w2_weight_list]
-                layer._hif8_cached_w2_ptr = w2_ptr
-            w2 = layer._hif8_cached_w2
+            w1 = [_hif8_fake_quant(w, self.granularity, self.group_size).contiguous()
+                  for w in layer.w13_weight_list]
+            w2 = [_hif8_fake_quant(w, self.granularity, self.group_size).contiguous()
+                  for w in layer.w2_weight_list]
         else:
-            w1_ptr = layer.w13_weight.data_ptr()
-            if getattr(layer, "_hif8_cached_w1_ptr", None) != w1_ptr:
-                layer._hif8_cached_w1 = _hif8_fake_quant(
-                    layer.w13_weight, self.granularity, self.group_size
-                ).contiguous()
-                layer._hif8_cached_w1_ptr = w1_ptr
-            w1 = layer._hif8_cached_w1
-
-            w2_ptr = layer.w2_weight.data_ptr()
-            if getattr(layer, "_hif8_cached_w2_ptr", None) != w2_ptr:
-                layer._hif8_cached_w2 = _hif8_fake_quant(
-                    layer.w2_weight, self.granularity, self.group_size
-                ).contiguous()
-                layer._hif8_cached_w2_ptr = w2_ptr
-            w2 = layer._hif8_cached_w2
+            w1 = _hif8_fake_quant(layer.w13_weight, self.granularity, self.group_size).contiguous()
+            w2 = _hif8_fake_quant(layer.w2_weight, self.granularity, self.group_size).contiguous()
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
@@ -353,10 +318,6 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
-
-        # Invalidate weight cache — first apply will re-quantize
-        layer._hif8_cached_w1_ptr = None
-        layer._hif8_cached_w2_ptr = None
 
         if self.dynamic_eplb:
             layer.w13_weight_list = [
