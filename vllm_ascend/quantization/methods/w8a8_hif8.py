@@ -114,18 +114,18 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        """Pseudo-quant with configured granularity (same _quant_hif8 as QAT).
-        Weight and activation are both re-quantized every forward.
-        No caching — avoids double bf16 memory that would OOM during weight sync.
-        """
+        """Pseudo-quant: activation quant every forward, weight already
+        pre-quantized in process_weights_after_loading (called at init and
+        after every verl weight sync)."""
         x_dtype = x.dtype
         x_fq = _hif8_fake_quant(x, self.granularity, self.group_size).contiguous()
-        w_fq = _hif8_fake_quant(layer.weight, self.granularity, self.group_size).contiguous()
-        output = F.linear(x_fq.to(x_dtype), w_fq.to(x_dtype), bias=bias)
+        # layer.weight is already fake-quantized — use directly
+        output = F.linear(x_fq.to(x_dtype), layer.weight, bias=bias)
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Post-load: nothing needed — F.linear uses standard (out, in) layout."""
+        """Weights are pre-quantized on the verl side before ZMQ send.
+        Nothing to do here — apply() uses layer.weight directly."""
 
 
 @register_scheme("W8A8_HIF8", "moe")
@@ -282,17 +282,14 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
         # HiF8 pseudo-quant: activation — must redo every forward
         x = _hif8_fake_quant(x, self.granularity, self.group_size).contiguous()
 
-        # HiF8 pseudo-quant: expert weights — re-quantize every forward.
-        # MoE weights are too large to cache a second bf16 copy (~25 GB);
-        # the quant overhead is amortised by the fused_experts computation.
+        # Expert weights are already pre-quantized in process_weights_after_loading
+        # (called at init and after every verl weight sync).  Use directly.
         if self.dynamic_eplb:
-            w1 = [_hif8_fake_quant(w, self.granularity, self.group_size).contiguous()
-                  for w in layer.w13_weight_list]
-            w2 = [_hif8_fake_quant(w, self.granularity, self.group_size).contiguous()
-                  for w in layer.w2_weight_list]
+            w1 = layer.w13_weight_list
+            w2 = layer.w2_weight_list
         else:
-            w1 = _hif8_fake_quant(layer.w13_weight, self.granularity, self.group_size).contiguous()
-            w2 = _hif8_fake_quant(layer.w2_weight, self.granularity, self.group_size).contiguous()
+            w1 = layer.w13_weight
+            w2 = layer.w2_weight
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
