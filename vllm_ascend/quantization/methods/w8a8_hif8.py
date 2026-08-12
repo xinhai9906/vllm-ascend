@@ -23,9 +23,11 @@ Configurable-granularity fake quant matching verl QAT:
 
 Granularity modes (per_tensor / per_channel / per_group) share the same
 _quant_hif8 tapered-precision kernel as training QAT.
-Weights and activations are both re-quantized every forward — no caching,
-to avoid double bf16 memory during verl weight sync.  All computation
-stays in bf16 (no real hardware quantization).
+
+When rotation is enabled, activations are rotated by a block-Hadamard-sign
+matrix before quantisation; weights arrive pre-rotated+quantised from the
+verl training side via ZMQ, so no further rotation is needed on the weight
+path.
 """
 
 from collections.abc import Callable
@@ -36,6 +38,7 @@ import torch.nn.functional as F
 
 from vllm_ascend.ascend_config import get_ascend_config
 
+from ..block_rotation import apply_block_rotation
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
 
@@ -97,9 +100,19 @@ def _hif8_fake_quant(
 class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
     """Per-tensor/per-channel/per-group pseudo-quant matching verl QAT."""
 
-    def __init__(self, granularity: str = "per_tensor", group_size: int = 32):
+    def __init__(
+        self,
+        granularity: str = "per_tensor",
+        group_size: int = 32,
+        rotation_enable: bool = False,
+        rotation_block_size: int = 32,
+        rotation_seed: int = 0,
+    ):
         self.granularity = granularity
         self.group_size = group_size
+        self.rotation_enable = rotation_enable
+        self.rotation_block_size = rotation_block_size
+        self.rotation_seed = rotation_seed
 
     def get_weight(
         self, input_size: int, output_size: int, params_dtype: torch.dtype
@@ -116,10 +129,24 @@ class AscendW8A8HiF8LinearMethod(AscendLinearScheme):
     ) -> torch.Tensor:
         """Pseudo-quant: activation quant every forward, weight already
         pre-quantized in process_weights_after_loading (called at init and
-        after every verl weight sync)."""
+        after every verl weight sync).
+
+        When rotation is enabled, the activation is rotated by Q before
+        quantisation so that quant noise matches the training distribution.
+        Weights arrive pre-rotated+quantised from verl, so no weight-side
+        rotation is needed here.
+        """
         x_dtype = x.dtype
-        x_fq = _hif8_fake_quant(x, self.granularity, self.group_size).contiguous()
-        # layer.weight is already fake-quantized — use directly
+        # Apply block rotation to activation BEFORE quantisation.
+        x_rotated = apply_block_rotation(
+            x,
+            enable=self.rotation_enable,
+            block_size=self.rotation_block_size,
+            seed=self.rotation_seed,
+        )
+        x_fq = _hif8_fake_quant(
+            x_rotated, self.granularity, self.group_size
+        ).contiguous()
         output = F.linear(x_fq.to(x_dtype), layer.weight, bias=bias)
         return output
 
@@ -134,13 +161,23 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
 
     quant_type: QuantType = QuantType.W8A8HIF8
 
-    def __init__(self, granularity: str = "per_tensor", group_size: int = 32):
+    def __init__(
+        self,
+        granularity: str = "per_tensor",
+        group_size: int = 32,
+        rotation_enable: bool = False,
+        rotation_block_size: int = 32,
+        rotation_seed: int = 0,
+    ):
         from vllm.config import CompilationMode, get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
         ascend_config = get_ascend_config()
         self.granularity = granularity
         self.group_size = group_size
+        self.rotation_enable = rotation_enable
+        self.rotation_block_size = rotation_block_size
+        self.rotation_seed = rotation_seed
         self.use_aclgraph = (
             vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
             and not vllm_config.model_config.enforce_eager
@@ -279,7 +316,15 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
 
-        # HiF8 pseudo-quant: activation — must redo every forward
+        # Apply block rotation to activation BEFORE quantisation to match
+        # training distribution.  Expert weights arrive pre-rotated+quantised
+        # from verl, so no weight-side rotation is needed here.
+        x = apply_block_rotation(
+            x,
+            enable=self.rotation_enable,
+            block_size=self.rotation_block_size,
+            seed=self.rotation_seed,
+        )
         x = _hif8_fake_quant(x, self.granularity, self.group_size).contiguous()
 
         # Expert weights are already pre-quantized in process_weights_after_loading

@@ -42,6 +42,7 @@ if vllm_version_is("0.23.0"):
 else:
     from vllm.model_executor.layers.fused_moe import MoERunner
 
+from .block_rotation import _parse_rotation_config
 from .methods import get_scheme_class
 
 ASCEND_HIF8_METHOD = "ascend-hif8"
@@ -120,19 +121,33 @@ class AscendHiF8Config(QuantizationConfig):
             AscendLinearMethod,
         )
 
+        rotation = _parse_rotation_config(self.quant_description)
+
         if isinstance(layer, LinearBase):
             layer.ascend_quant_method = ASCEND_HIF8_METHOD
 
             scheme_cls = get_scheme_class("W8A8_HIF8", "linear")
             if scheme_cls is not None:
-                scheme = scheme_cls(granularity=self.granularity, group_size=self.group_size)
+                scheme = scheme_cls(
+                    granularity=self.granularity,
+                    group_size=self.group_size,
+                    rotation_enable=rotation["enable"],
+                    rotation_block_size=rotation["block_size"],
+                    rotation_seed=rotation["seed"],
+                )
                 return AscendLinearMethod(scheme)
 
         if _is_fused_moe_layer(layer):
             layer.ascend_quant_method = ASCEND_HIF8_METHOD
             scheme_cls = get_scheme_class("W8A8_HIF8", "moe")
             if scheme_cls is not None:
-                scheme = scheme_cls(granularity=self.granularity, group_size=self.group_size)
+                scheme = scheme_cls(
+                    granularity=self.granularity,
+                    group_size=self.group_size,
+                    rotation_enable=rotation["enable"],
+                    rotation_block_size=rotation["block_size"],
+                    rotation_seed=rotation["seed"],
+                )
                 return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid=tid2eid)
 
         logger.warning_once(
