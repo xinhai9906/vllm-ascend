@@ -316,15 +316,11 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
 
-        # Apply block rotation to activation BEFORE quantisation to match
-        # training distribution.  Expert weights arrive pre-rotated+quantised
-        # from verl, so no weight-side rotation is needed here.
-        x = apply_block_rotation(
-            x,
-            enable=self.rotation_enable,
-            block_size=self.rotation_block_size,
-            seed=self.rotation_seed,
-        )
+        # Block rotation is NOT applied to the MoE input: down_proj weights
+        # rotate along the intermediate dimension whose activations are
+        # produced inside the fused kernel (never rotated), so the Q@Q^T
+        # cancellation cannot hold.  MoE runs unrotated on both training and
+        # inference sides; only dense Linear layers use rotation.
         x = _hif8_fake_quant(x, self.granularity, self.group_size).contiguous()
 
         # Expert weights are already pre-quantized in process_weights_after_loading
