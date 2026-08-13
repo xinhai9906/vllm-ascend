@@ -129,8 +129,12 @@ class AscendHiF8Config(QuantizationConfig):
                 # (ignore pattern `.*mlp.gate$`): their weights arrive
                 # unrotated and unquantized.  Wrapping the router here would
                 # rotate/quantize the router input and desynchronize routing
-                # from training.  Keep the router in the original dtype.
-                return None
+                # from training.  Use an unquantized pass-through method so
+                # the router runs in the original dtype (vllm-ascend's
+                # ReplicatedLinear asserts a quant method is present).
+                from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+                return UnquantizedLinearMethod()
             layer.ascend_quant_method = ASCEND_HIF8_METHOD
 
             scheme_cls = get_scheme_class("W8A8_HIF8", "linear")
