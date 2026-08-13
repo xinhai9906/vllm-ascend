@@ -124,6 +124,13 @@ class AscendHiF8Config(QuantizationConfig):
         rotation = _parse_rotation_config(self.quant_description)
 
         if isinstance(layer, LinearBase):
+            if prefix.endswith(".gate"):
+                # MoE router gates are excluded from QAT on the verl side
+                # (ignore pattern `.*mlp.gate$`): their weights arrive
+                # unrotated and unquantized.  Wrapping the router here would
+                # rotate/quantize the router input and desynchronize routing
+                # from training.  Keep the router in the original dtype.
+                return None
             layer.ascend_quant_method = ASCEND_HIF8_METHOD
 
             scheme_cls = get_scheme_class("W8A8_HIF8", "linear")
