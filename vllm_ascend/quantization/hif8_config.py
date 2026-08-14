@@ -34,6 +34,9 @@ from vllm.logger import logger
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    check_equal_or_regex_match,
+)
 
 from vllm_ascend.utils import vllm_version_is
 
@@ -124,14 +127,16 @@ class AscendHiF8Config(QuantizationConfig):
         rotation = _parse_rotation_config(self.quant_description)
 
         if isinstance(layer, LinearBase):
-            if prefix.endswith(".gate"):
-                # MoE router gates are excluded from QAT on the verl side
-                # (ignore pattern `.*mlp.gate$`): their weights arrive
-                # unrotated and unquantized.  Wrapping the router here would
-                # rotate/quantize the router input and desynchronize routing
-                # from training.  Use an unquantized pass-through method so
-                # the router runs in the original dtype (vllm-ascend's
-                # ReplicatedLinear asserts a quant method is present).
+            if prefix.endswith(".gate") or check_equal_or_regex_match(prefix, self.ignore):
+                # Ignored layers (e.g. lm_head) and MoE router gates are
+                # excluded from QAT on the verl side: their weights arrive
+                # unrotated and unquantized, and the training forward runs
+                # them in the original basis.  Wrapping them here would
+                # rotate/quantize their inputs (with no matching weight
+                # rotation) and desynchronize the computation from training.
+                # Use an unquantized pass-through method so they run in the
+                # original dtype (vllm-ascend's ReplicatedLinear asserts a
+                # quant method is present).
                 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
                 return UnquantizedLinearMethod()
