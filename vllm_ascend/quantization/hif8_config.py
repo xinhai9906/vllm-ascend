@@ -63,7 +63,9 @@ def _is_fused_moe_layer(layer: torch.nn.Module) -> bool:
 class AscendHiF8Config(QuantizationConfig):
     """Quantization config for Ascend HiF8 (W8A8_HIF8 pseudo-quant).
     Uses the same _quant_hif8 tapered-precision software quant as verl QAT.
-    Supports per_tensor, per_channel, and per_group granularity.
+    Supports per_tensor, per_channel, per_group, and per_group_median
+    granularity (per_group_median anchors the median of |x| to 1.0 with
+    amax/49152 as the lower bound).
     """
 
     def __init__(
@@ -154,6 +156,16 @@ class AscendHiF8Config(QuantizationConfig):
                 return AscendLinearMethod(scheme)
 
         if _is_fused_moe_layer(layer):
+            if check_equal_or_regex_match(prefix, self.ignore):
+                # Mixed-precision fallback: ignored MoE blocks (e.g. sensitive
+                # layers 45-47) run completely unquantized, matching the
+                # training-side MoE QAT which skips the same blocks.  Use the
+                # Ascend-specific unquantized method — it implements the
+                # router_logits-based apply() signature that vllm-ascend's
+                # FusedMoE wrapper (fused_moe_0_23_0) dispatches through.
+                from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
+
+                return AscendUnquantizedFusedMoEMethod(layer.moe_config, tid2eid=tid2eid)
             layer.ascend_quant_method = ASCEND_HIF8_METHOD
             scheme_cls = get_scheme_class("W8A8_HIF8", "moe")
             if scheme_cls is not None:

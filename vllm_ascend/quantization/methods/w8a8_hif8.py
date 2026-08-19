@@ -21,8 +21,10 @@ Configurable-granularity fake quant matching verl QAT:
   scale = amax / 49152
   pseudo = _quant_hif8(tensor / scale) * scale
 
-Granularity modes (per_tensor / per_channel / per_group) share the same
-_quant_hif8 tapered-precision kernel as training QAT.
+Granularity modes (per_tensor / per_channel / per_group / per_group_median)
+share the same _quant_hif8 tapered-precision kernel as training QAT.
+per_group_median anchors the median of |x| to 1.0 with amax/49152 as the
+lower bound, so no truncation occurs.
 
 When rotation is enabled, activations are rotated by a block-Hadamard-sign
 matrix before quantisation; weights arrive pre-rotated+quantised from the
@@ -73,16 +75,38 @@ def _hif8_fake_quant(
     granularity='per_tensor':  one scale per tensor
     granularity='per_channel': one scale per output channel (weight) / per token (act)
     granularity='per_group':   one scale per group of group_size elements
+    granularity='per_group_median': one scale per group, anchored to the median
+        of |x| (average of the two middle sorted values for even group_size,
+        single middle for odd) mapped to 1.0, with amax/HIF8_MAX as the lower
+        bound so truncation never occurs.
     """
-    if granularity == "per_group":
+    if granularity in ("per_group", "per_group_median"):
         t = tensor.float()
         dim_size = t.shape[-1]
         pad = (group_size - dim_size % group_size) % group_size
         if pad:
-            t = F.pad(t, (0, pad))
+            t = F.pad(t, (0, pad))            # zeros, for amax + quant
         t_blocks = t.unflatten(-1, (-1, group_size))
         amax = t_blocks.abs().amax(dim=-1, keepdim=True)
-        scale = (amax / _HIF8_MAX).clamp(min=1e-12)
+        if granularity == "per_group_median":
+            # Median of |x| per group: average of the two middle sorted values
+            # (indices gs//2-1, gs//2 for even gs; single middle for odd gs).
+            # Pad positions are imputed +inf so they sort to the tail and
+            # cannot distort the valid median; a tail block with gs//2 or
+            # fewer valid elements has +inf inside the slice, which
+            # posinf=0.0 maps to the amax-based lower bound. amax stays on
+            # the zero-padded t_blocks so a padded tail never reads +inf.
+            abs_med = tensor.float().abs()
+            if pad:
+                abs_med = F.pad(abs_med, (0, pad), value=float("inf"))
+            sorted_vals = abs_med.unflatten(-1, (-1, group_size)).sort(dim=-1).values
+            lo = (group_size - 1) // 2
+            hi = group_size // 2 + 1
+            median_avg = sorted_vals[..., lo:hi].mean(dim=-1, keepdim=True)
+            median_avg = torch.nan_to_num(median_avg, nan=0.0, posinf=0.0)
+            scale = torch.maximum(median_avg, amax / _HIF8_MAX).clamp(min=1e-12)
+        else:
+            scale = (amax / _HIF8_MAX).clamp(min=1e-12)
         q_blocks = _quant_hif8(t_blocks / scale) * scale
         result = q_blocks.flatten(-2, -1)
         if pad:
