@@ -28,6 +28,8 @@ from vllm_ascend.device.mxfp_compat import (
 )
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
+from vllm_ascend.ops.fused_moe.moe_stage_params import MoERotationParams
+from vllm_ascend.quantization.block_rotation import apply_block_rotation
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
     dispose_tensor,
@@ -376,6 +378,7 @@ def unquant_apply_mlp(
     lora_context=None,
     expanded_row_idx: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    rotation: MoERotationParams | None = None,
 ) -> torch.Tensor:
     if need_trans:
         w1 = w1.transpose(1, 2)
@@ -435,6 +438,17 @@ def unquant_apply_mlp(
 
     if topk_scales is not None:
         gate_up_out *= topk_scales
+
+    if rotation is not None and rotation.enable:
+        # HiF8 block rotation: w2 arrives pre-rotated from the training side
+        # (rotated on the intermediate dim), so rotate the intermediate
+        # activation here to preserve the Q·Qᵀ = I cancellation.
+        gate_up_out = apply_block_rotation(
+            gate_up_out,
+            enable=True,
+            block_size=rotation.block_size,
+            seed=rotation.seed,
+        )
 
     hidden_states = torch_npu.npu_grouped_matmul(
         x=[gate_up_out],
@@ -500,6 +514,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             lora_context=mlp_compute_input.lora_context,
             expanded_row_idx=mlp_compute_input.expanded_row_idx,
             topk_ids=mlp_compute_input.topk_ids,
+            rotation=mlp_compute_input.rotation,
         )
 
     assert w1_scale is not None and w2_scale is not None

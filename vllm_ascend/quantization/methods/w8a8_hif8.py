@@ -21,10 +21,10 @@ Configurable-granularity fake quant matching verl QAT:
   scale = amax / 49152
   pseudo = _quant_hif8(tensor / scale) * scale
 
-Granularity modes (per_tensor / per_channel / per_group / per_group_median)
-share the same _quant_hif8 tapered-precision kernel as training QAT.
-per_group_median anchors the median of |x| to 1.0 with amax/49152 as the
-lower bound, so no truncation occurs.
+Granularity modes (per_tensor / per_channel / per_group / per_group_median /
+per_channel_median) share the same _quant_hif8 tapered-precision kernel as
+training QAT. per_group_median and per_channel_median anchor the median of
+|x| to 1.0 with amax/49152 as the lower bound, so no truncation occurs.
 
 When rotation is enabled, activations are rotated by a block-Hadamard-sign
 matrix before quantisation; weights arrive pre-rotated+quantised from the
@@ -39,6 +39,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ops.fused_moe.moe_stage_params import MoERotationParams
 
 from ..block_rotation import apply_block_rotation
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
@@ -79,6 +80,9 @@ def _hif8_fake_quant(
         of |x| (average of the two middle sorted values for even group_size,
         single middle for odd) mapped to 1.0, with amax/HIF8_MAX as the lower
         bound so truncation never occurs.
+    granularity='per_channel_median': one scale per row, anchored to the median
+        of |x| over the whole row, with amax/HIF8_MAX as the lower bound so
+        truncation never occurs.
     """
     if granularity in ("per_group", "per_group_median"):
         t = tensor.float()
@@ -112,6 +116,23 @@ def _hif8_fake_quant(
         if pad:
             result = result[..., :dim_size]
         return result.to(tensor.dtype)
+    elif granularity == "per_channel_median":
+        # Median of |x| per channel (row): average of the two middle sorted
+        # values (indices dim//2-1, dim//2 for even dim, single middle for
+        # odd), anchored to 1.0, with amax/HIF8_MAX as the lower bound so
+        # truncation never occurs.  No padding — the whole row is sorted, so
+        # there is no tail-group edge case (unlike per_group_median).
+        t = tensor.float()
+        abs_t = t.abs()
+        sorted_vals = abs_t.sort(dim=-1).values
+        dim_size = t.shape[-1]
+        lo = (dim_size - 1) // 2
+        hi = dim_size // 2 + 1
+        median_avg = sorted_vals[..., lo:hi].mean(dim=-1, keepdim=True)
+        median_avg = torch.nan_to_num(median_avg, nan=0.0)
+        amax = abs_t.amax(dim=-1, keepdim=True)
+        scale = torch.maximum(median_avg, amax / _HIF8_MAX).clamp(min=1e-12)
+        return (_quant_hif8(t / scale) * scale).to(tensor.dtype)
     elif granularity == "per_channel":
         amax = tensor.float().abs().amax(dim=-1, keepdim=True)
     else:
@@ -340,15 +361,47 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
 
-        # Block rotation is NOT applied to the MoE input: down_proj weights
-        # rotate along the intermediate dimension whose activations are
-        # produced inside the fused kernel (never rotated), so the Q@Q^T
-        # cancellation cannot hold.  MoE runs unrotated on both training and
-        # inference sides; only dense Linear layers use rotation.
+        # Block rotation: rotate the MoE input (hidden dim) by the same Q that
+        # pre-rotated the w13 weights (done by the verl weight sync), so the
+        # Q·Qᵀ cancellation holds and only the quant noise changes.  The
+        # router gate consumes the unrotated x with unrotated weights, so
+        # routing logits are identical to training (which rotates both).
+        # The intermediate activation is rotated inside unquant_apply_mlp,
+        # driven by the rotation params passed to build_fused_experts_input.
+        if self.rotation_enable:
+            if n_shared_experts > 0:
+                raise NotImplementedError(
+                    "[W8A8_HIF8] Block rotation is not supported for MoE "
+                    "blocks with shared experts: the training side runs them "
+                    "unrotated, so rotating here would desynchronize the two "
+                    "sides. Disable rotation for shared-expert models."
+                )
+            if apply_router_weight_on_input:
+                raise NotImplementedError(
+                    "[W8A8_HIF8] Block rotation is not supported when "
+                    "apply_router_weight_on_input=True (routing is computed "
+                    "inside the fused kernel from the rotated input). "
+                    "Disable rotation for such models."
+                )
+            moe_comm_type = getattr(_EXTRA_CTX, "moe_comm_type", None)
+            if moe_comm_type in (MoECommType.MC2, MoECommType.FUSED_MC2):
+                raise NotImplementedError(
+                    "[W8A8_HIF8] Block rotation is not supported with the MC2 "
+                    "MoE comm path (the fused dispatch kernel cannot rotate "
+                    "the intermediate activation). Disable rotation or use "
+                    "all-to-all/all-gather MoE comm."
+                )
+            x = apply_block_rotation(
+                x,
+                enable=True,
+                block_size=self.rotation_block_size,
+                seed=self.rotation_seed,
+            )
         x = _hif8_fake_quant(x, self.granularity, self.group_size).contiguous()
 
-        # Expert weights are already pre-quantized in process_weights_after_loading
-        # (called at init and after every verl weight sync).  Use directly.
+        # Expert weights arrive pre-rotated+pre-quantized from the verl weight
+        # sync (rotation folded into the weights there); process_weights_after_loading
+        # only transposes layouts.  Use directly.
         if self.dynamic_eplb:
             w1 = layer.w13_weight_list
             w2 = layer.w2_weight_list
@@ -369,6 +422,11 @@ class AscendW8A8HiF8FusedMoEMethod(AscendMoEScheme):
                 swiglu_limit=layer.swiglu_limit,
                 w1_scale=[layer.w13_weight_scale],
                 w2_scale=[layer.w2_weight_scale],
+                rotation=MoERotationParams(
+                    enable=self.rotation_enable,
+                    block_size=self.rotation_block_size,
+                    seed=self.rotation_seed,
+                ),
             )
         )
 

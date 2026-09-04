@@ -22,7 +22,7 @@ from typing import Any, Generic, TypeVar
 import numpy as np
 import torch
 
-from vllm_ascend.ops.fused_moe.moe_stage_params import MoEQuantParams, MoERoutingParams
+from vllm_ascend.ops.fused_moe.moe_stage_params import MoEQuantParams, MoERotationParams, MoERoutingParams
 
 TMoECombineMetadata = TypeVar("TMoECombineMetadata")
 
@@ -73,6 +73,9 @@ class MoEFusedExpertsInput:
     # ``Any`` avoids coupling the core contracts to the LoRA module; only the
     # unquant MLP path reads it, and only when a LoRA adapter is active.
     lora_context: Any = None
+    # Optional block-rotation settings (HiF8 pseudo-quant MoE); read by the
+    # unquant MLP path to rotate the intermediate activation before down_proj.
+    rotation: MoERotationParams | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +152,8 @@ class MoEMlpComputeInput:
     topk_ids: torch.Tensor | None = None
     # Optional per-layer MoE LoRA state, propagated from MoEFusedExpertsInput.
     lora_context: Any = None
+    # Optional block-rotation settings, propagated from MoEFusedExpertsInput.
+    rotation: MoERotationParams | None = None
 
 
 __all__ = [

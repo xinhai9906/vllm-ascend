@@ -19,6 +19,8 @@ import torch
 import torch_npu
 
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
+from vllm_ascend.ops.fused_moe.moe_stage_params import MoERotationParams
+from vllm_ascend.quantization.block_rotation import apply_block_rotation
 
 
 def quant_apply_mlp(
@@ -45,7 +47,12 @@ def quant_apply_mlp(
 
 
 def unquant_apply_mlp(
-    hidden_states: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, group_list: torch.Tensor, group_list_type: int = 1
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    group_list: torch.Tensor,
+    group_list_type: int = 1,
+    rotation: MoERotationParams | None = None,
 ) -> torch.Tensor:
     gate_up_out = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
@@ -56,6 +63,17 @@ def unquant_apply_mlp(
         group_list=group_list,
     )[0]
     act_out = torch_npu.npu_swiglu(gate_up_out)
+
+    if rotation is not None and rotation.enable:
+        # HiF8 block rotation: w2 arrives pre-rotated from the training side
+        # (rotated on the intermediate dim), so rotate the intermediate
+        # activation here to preserve the Q·Qᵀ = I cancellation.
+        act_out = apply_block_rotation(
+            act_out,
+            enable=True,
+            block_size=rotation.block_size,
+            seed=rotation.seed,
+        )
 
     hidden_states = torch_npu.npu_grouped_matmul(
         x=[act_out],
@@ -99,4 +117,5 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         w2=w2,
         group_list=group_list,
         group_list_type=group_list_type,
+        rotation=mlp_compute_input.rotation,
     )

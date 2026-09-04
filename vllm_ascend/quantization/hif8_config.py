@@ -63,9 +63,9 @@ def _is_fused_moe_layer(layer: torch.nn.Module) -> bool:
 class AscendHiF8Config(QuantizationConfig):
     """Quantization config for Ascend HiF8 (W8A8_HIF8 pseudo-quant).
     Uses the same _quant_hif8 tapered-precision software quant as verl QAT.
-    Supports per_tensor, per_channel, per_group, and per_group_median
-    granularity (per_group_median anchors the median of |x| to 1.0 with
-    amax/49152 as the lower bound).
+    Supports per_tensor, per_channel, per_group, per_group_median, and
+    per_channel_median granularity (per_group_median and per_channel_median
+    anchor the median of |x| to 1.0 with amax/49152 as the lower bound).
     """
 
     def __init__(

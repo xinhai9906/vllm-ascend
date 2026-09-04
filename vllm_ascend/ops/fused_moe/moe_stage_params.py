@@ -56,6 +56,21 @@ class MoEMxfpParams:
 
 
 @dataclass(frozen=True, slots=True)
+class MoERotationParams:
+    """Block-rotation settings for the unquant MoE MLP path (HiF8 pseudo-quant).
+
+    When enabled, the intermediate activation (swiglu output) is rotated by the
+    same block-Hadamard matrix that pre-rotated the w2 weights, preserving the
+    Q·Qᵀ = I cancellation.  ``block_size``/``seed`` must match the training-side
+    ``verl.utils.qat.block_rotation`` configuration.
+    """
+
+    enable: bool = False
+    block_size: int = 32
+    seed: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class MoEQuantParams:
     """Quant mode, backend override, and optional internal MXFP leaf config."""
 
@@ -124,4 +139,5 @@ __all__ = [
     "MoERoutingParams",
     "MoEMxfpParams",
     "MoEQuantParams",
+    "MoERotationParams",
 ]
